@@ -1,6 +1,6 @@
 /*
  * N-body gravitational acceleration calculation in C++
- * Adapted from Project 1's accel.c implementation
+ * Ultra-precision version using long double + Kahan summation
  */
 
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
@@ -9,7 +9,7 @@
 #include <numpy/arrayobject.h>
 #include <cmath>
 
-#define G 6.67259e-8  // [cm^3/g/s^2]
+#define G 6.67259e-8L  // [cm^3/g/s^2]
 
 static PyObject* get_accel([[maybe_unused]] PyObject* self, PyObject* args) {
     PyArrayObject* R_arr = nullptr;
@@ -45,32 +45,49 @@ static PyObject* get_accel([[maybe_unused]] PyObject* self, PyObject* args) {
         return nullptr;
     }
     
-    double* R = (double*)PyArray_DATA(R_arr);
-    double* M = (double*)PyArray_DATA(M_arr);
+    double* R_in = (double*)PyArray_DATA(R_arr);
+    double* M_in = (double*)PyArray_DATA(M_arr);
     double* A = (double*)PyArray_DATA(A_arr);
     
     for (int i = 0; i < N; i++) {
-        double ax = 0.0, ay = 0.0, az = 0.0;
+        // Use long double for all internal calculations
+        long double ax = 0.0L, ay = 0.0L, az = 0.0L;
+        long double cx = 0.0L, cy = 0.0L, cz = 0.0L;  // Kahan compensation
         
         for (int j = 0; j < N; j++) {
             if (i == j) continue;
             
-            double dx = R[i*3 + 0] - R[j*3 + 0];
-            double dy = R[i*3 + 1] - R[j*3 + 1];
-            double dz = R[i*3 + 2] - R[j*3 + 2];
+            long double dx = (long double)R_in[i*3 + 0] - (long double)R_in[j*3 + 0];
+            long double dy = (long double)R_in[i*3 + 1] - (long double)R_in[j*3 + 1];
+            long double dz = (long double)R_in[i*3 + 2] - (long double)R_in[j*3 + 2];
             
-            double r2 = dx*dx + dy*dy + dz*dz;
-            double ir3 = std::pow(r2, -1.5);
+            long double r2 = dx*dx + dy*dy + dz*dz;
+            long double r = sqrtl(r2);
+            long double r3 = r2 * r;
+            long double ir3 = 1.0L / r3;
             
-            double factor = G * M[j] * ir3;
-            ax -= factor * dx;
-            ay -= factor * dy;
-            az -= factor * dz;
+            long double factor = G * (long double)M_in[j] * ir3;
+            
+            // Kahan summation with long double
+            long double term_x = -factor * dx - cx;
+            long double temp_x = ax + term_x;
+            cx = (temp_x - ax) - term_x;
+            ax = temp_x;
+            
+            long double term_y = -factor * dy - cy;
+            long double temp_y = ay + term_y;
+            cy = (temp_y - ay) - term_y;
+            ay = temp_y;
+            
+            long double term_z = -factor * dz - cz;
+            long double temp_z = az + term_z;
+            cz = (temp_z - az) - term_z;
+            az = temp_z;
         }
         
-        A[i*3 + 0] = ax;
-        A[i*3 + 1] = ay;
-        A[i*3 + 2] = az;
+        A[i*3 + 0] = (double)ax;
+        A[i*3 + 1] = (double)ay;
+        A[i*3 + 2] = (double)az;
     }
     
     return (PyObject*)A_arr;
@@ -85,7 +102,7 @@ static PyMethodDef accel_methods[] = {
 static struct PyModuleDef accel_module = {
     PyModuleDef_HEAD_INIT,
     "accel",
-    "N-body gravitational acceleration module",
+    "N-body gravitational acceleration module (ultra precision)",
     -1,
     accel_methods,
     nullptr,
