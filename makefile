@@ -1,4 +1,4 @@
-# Makefile for accel C++ extension module
+# Makefile for C++ extension modules
 
 PYTHON := python3
 PYTHON_CONFIG := python3-config
@@ -7,7 +7,7 @@ PYTHON_INCLUDE := $(shell $(PYTHON_CONFIG) --includes)
 PYTHON_LDFLAGS := $(shell $(PYTHON_CONFIG) --ldflags --embed 2>/dev/null || $(PYTHON_CONFIG) --ldflags)
 
 CXX := g++
-CXXFLAGS := -std=c++23 -O1 -fPIC -Wall -Wextra -pedantic
+CXXFLAGS := -std=c++23 -O3 -fPIC -Wall -Wextra -pedantic
 INCLUDES := $(PYTHON_INCLUDE) -I$(NUMPY_INCLUDE)
 
 UNAME_S := $(shell uname -s)
@@ -20,20 +20,26 @@ ifeq ($(UNAME_S),Darwin)
     LDFLAGS := -bundle -undefined dynamic_lookup
 endif
 
-TARGET := accel$(EXT_SUFFIX)
-SOURCE := accel.cpp
+TARGET_ACCEL := accel$(EXT_SUFFIX)
+TARGET_SIM := simulator$(EXT_SUFFIX)
+SOURCE_ACCEL := accel.cpp
+SOURCE_SIM := simulator.cpp
 
 .PHONY: all clean test
 
-all: $(TARGET)
+all: $(TARGET_ACCEL) $(TARGET_SIM)
 
-$(TARGET): $(SOURCE)
+$(TARGET_ACCEL): $(SOURCE_ACCEL)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(LDFLAGS) -o $@ $<
+
+$(TARGET_SIM): $(SOURCE_SIM)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $(LDFLAGS) -o $@ $<
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET_ACCEL) $(TARGET_SIM)
 	rm -rf __pycache__
 	rm -f *.pyc
 
-test: $(TARGET)
+test: $(TARGET_ACCEL) $(TARGET_SIM)
 	$(PYTHON) test_accel.py
+	$(PYTHON) proj1.py

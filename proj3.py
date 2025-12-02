@@ -1,11 +1,14 @@
 import numpy as np
 import pandas as pd
 import time
+import matplotlib
+matplotlib.use('TkAgg')  # Use Tk backend to avoid Qt warnings
 import matplotlib.pyplot as plt
 from astropy.coordinates import get_body_barycentric_posvel
 from astropy import units as u
 from astropy.time import Time
 from accel import get_accel  # returns N x 3 accelerations in cm/s²
+from simulator import run_simulation  # C++ simulation module
 
 # Constants
 AU = 1.496e13      # cm
@@ -117,6 +120,17 @@ print(f"Simulating {n_years:.2f} years (~{n_orbits} orbits of {outermost_planet.
 
 n_step = int((n_years * yr) / dt)
 
+# Prepare perturbation arrays for C++
+perturb_indices = []
+for planet in perturb_planets:
+    if planet in planet_idx:
+        perturb_indices.append(planet_idx[planet])
+    else:
+        print(f"Warning: '{planet}' not recognized. Skipping.")
+
+perturb_indices = np.array(perturb_indices, dtype=np.int32)
+n_perturb = len(perturb_indices)
+
 # Number of simulations
 n_simulations = int(input("Enter number of simulations to run: "))
 
@@ -126,61 +140,43 @@ all_dfs = []
 for sim in range(n_simulations):
     print(f"\n=== Simulation {sim+1}/{n_simulations} ===")
     
-    X = X0.copy()
-    V = V0.copy()
+    # Generate perturbations
+    perturb_pos = rng.normal(scale=perturb_pos_scale, size=(n_perturb, 3))
+    perturb_vel = rng.normal(scale=perturb_vel_scale, size=(n_perturb, 3))
     
-    # Apply perturbations
-    for planet in perturb_planets:
-        if planet in planet_idx:
-            idx = planet_idx[planet]
-
-            X[idx] += rng.normal(scale=perturb_pos_scale, size=3)
-            V[idx] += rng.normal(scale=perturb_vel_scale, size=3)
-        else:
-            print(f"Warning: '{planet}' not recognized. Skipping.")
+    # Run simulation in C++
+    results = run_simulation(
+        X0, V0, M,
+        perturb_indices,
+        perturb_pos,
+        perturb_vel,
+        sim + 1,
+        n_step,
+        dt,
+        yr
+    )
     
-    # Integration
-    acc = get_accel(X, M)
-    records = []
-
-    for step in range(n_step):
-        t = step * dt
-        V += acc * dt / 2
-        X += V * dt
-        acc = get_accel(X, M)
-        V += acc * dt / 2
-        
-        KE = 0.5 * M * np.sum(V**2, axis=1)
-        PE = np.zeros(N)
-        for i in range(N):
-            for j in range(i+1, N):
-                r = np.linalg.norm(X[i] - X[j])
-                PE[i] += -G * M[i] * M[j] / r
-                PE[j] += -G * M[i] * M[j] / r
-        
-        for i, body in enumerate(bodies):
-            records.append({
-                "simulation": sim+1,
-                "time_yr": t/yr,
-                "body": body,
-                "x_cm": X[i,0],
-                "y_cm": X[i,1],
-                "z_cm": X[i,2],
-                "vx_cm_s": V[i,0],
-                "vy_cm_s": V[i,1],
-                "vz_cm_s": V[i,2],
-                "KE": KE[i],
-                "PE": PE[i],
-                "E_tot": KE[i]+PE[i]
-            })
+    # Convert results to DataFrame
+    # Results shape: (n_step * N, 11)
+    # Columns: sim_id, time_yr, body_idx, x, y, z, vx, vy, vz, KE, PE
+    df_sim = pd.DataFrame(results, columns=[
+        "simulation", "time_yr", "body_idx",
+        "x_cm", "y_cm", "z_cm",
+        "vx_cm_s", "vy_cm_s", "vz_cm_s",
+        "KE", "PE"
+    ])
     
-    df_sim = pd.DataFrame(records)
+    # Add body names and total energy
+    df_sim["body"] = df_sim["body_idx"].apply(lambda idx: bodies[int(idx)])
+    df_sim["E_tot"] = df_sim["KE"] + df_sim["PE"]
+    df_sim = df_sim.drop(columns=["body_idx"])
+    
     all_dfs.append(df_sim)
 
 # Combine all simulations
 df = pd.concat(all_dfs, ignore_index=True)
 df.to_csv("solar_system_simulations.csv", index=False)
-print("All simulations complete. Data saved to solar_system_simulations.csv")
+print("\nAll simulations complete. Data saved to solar_system_simulations.csv")
 
 # putting two plots together
 fig, axes = plt.subplots(1, 2, figsize=(18, 9))  # 1 row, 2 columns
