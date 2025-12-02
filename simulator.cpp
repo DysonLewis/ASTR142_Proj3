@@ -1,8 +1,8 @@
 /*
- * N-body simulation integration module in C++
- * Handles the main simulation loop with leapfrog integration
- * Uses accel module for acceleration calculations
- */
+N-body simulation integration module in C++
+Handles the main simulation loop with leapfrog integration
+Calls Python accel module for gravitational acceleration calculations
+*/
 
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 
@@ -11,9 +11,8 @@
 #include <cmath>
 #include <vector>
 
-#define G 6.6743e-8L  // [cm^3/g/s^2]
+#define G 6.6743e-8L  // gravitational constant in cm^3 g^-1 s^-2
 
-// Structure to hold simulation results
 struct SimulationRecord {
     int simulation;
     double time_yr;
@@ -23,7 +22,16 @@ struct SimulationRecord {
     double KE, PE, E_tot;
 };
 
-// Call the accel module's get_accel function
+/*
+Call the Python accel module's get_accel function to compute accelerations.
+
+Args:
+    X_arr: N x 3 numpy array of positions in cm
+    M_arr: N length numpy array of masses in grams
+    
+Returns:
+    N x 3 numpy array of accelerations in cm/s^2
+*/
 static PyArrayObject* call_get_accel(PyArrayObject* X_arr, PyArrayObject* M_arr) {
     PyObject* accel_module = PyImport_ImportModule("accel");
     if (!accel_module) {
@@ -52,7 +60,25 @@ static PyArrayObject* call_get_accel(PyArrayObject* X_arr, PyArrayObject* M_arr)
     return (PyArrayObject*)result;
 }
 
-// Run a single simulation
+/*
+Run a single N-body simulation using leapfrog integration.
+
+Args:
+    X0_arr: N x 3 initial positions in cm
+    V0_arr: N x 3 initial velocities in cm/s
+    M_arr: N masses in grams
+    perturb_idx_arr: unused (kept for compatibility)
+    perturb_pos_arr: unused (kept for compatibility)
+    perturb_vel_arr: unused (kept for compatibility)
+    sim_id: simulation identifier
+    n_step: number of timesteps
+    dt: timestep in seconds
+    yr: conversion factor from seconds to years
+    
+Returns:
+    (n_step*N) x 11 numpy array containing:
+    [sim_id, time_yr, body_idx, x, y, z, vx, vy, vz, KE, PE]
+*/
 static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args) {
     PyArrayObject* X0_arr = nullptr;
     PyArrayObject* V0_arr = nullptr;
@@ -79,12 +105,11 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     }
     
     int N = PyArray_DIM(X0_arr, 0);
-    int n_perturb = PyArray_DIM(perturb_idx_arr, 0);
     
-    // Copy initial conditions
-    std::vector<double> X(N * 3);
-    std::vector<double> V(N * 3);
-    std::vector<double> M(N);
+    // Copy initial conditions to C++ vectors for fast access
+    std::vector<double> X(N * 3);  // positions flattened [x0,y0,z0,x1,y1,z1,...]
+    std::vector<double> V(N * 3);  // velocities flattened
+    std::vector<double> M(N);      // masses
     
     double* X0_data = (double*)PyArray_DATA(X0_arr);
     double* V0_data = (double*)PyArray_DATA(V0_arr);
@@ -98,22 +123,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         M[i] = M_data[i];
     }
     
-    // Apply perturbations
-    int* perturb_idx = (int*)PyArray_DATA(perturb_idx_arr);
-    double* perturb_pos = (double*)PyArray_DATA(perturb_pos_arr);
-    double* perturb_vel = (double*)PyArray_DATA(perturb_vel_arr);
-    
-    for (int p = 0; p < n_perturb; p++) {
-        int idx = perturb_idx[p];
-        X[idx*3 + 0] += perturb_pos[p*3 + 0];
-        X[idx*3 + 1] += perturb_pos[p*3 + 1];
-        X[idx*3 + 2] += perturb_pos[p*3 + 2];
-        V[idx*3 + 0] += perturb_vel[p*3 + 0];
-        V[idx*3 + 1] += perturb_vel[p*3 + 1];
-        V[idx*3 + 2] += perturb_vel[p*3 + 2];
-    }
-    
-    // Prepare output arrays
+    // Allocate output array for results
     npy_intp dims[2] = {(npy_intp)(n_step * N), 11};
     PyArrayObject* results = (PyArrayObject*)PyArray_ZEROS(2, dims, NPY_DOUBLE, 0);
     if (!results) {
@@ -121,7 +131,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     }
     double* results_data = (double*)PyArray_DATA(results);
     
-    // Create numpy arrays for positions and masses (for calling accel module)
+    // Create numpy arrays for passing to accel module
     npy_intp pos_dims[2] = {N, 3};
     npy_intp mass_dims[1] = {N};
     
@@ -135,13 +145,13 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         return nullptr;
     }
     
-    // Copy masses to numpy array (only need to do this once)
+    // Copy masses to numpy array (only need to do once since masses don't change)
     double* M_arr_data = (double*)PyArray_DATA(M_arr_np);
     for (int i = 0; i < N; i++) {
         M_arr_data[i] = M[i];
     }
     
-    // Initial acceleration
+    // Copy initial positions and compute initial acceleration
     double* X_arr_data = (double*)PyArray_DATA(X_arr);
     for (int i = 0; i < N * 3; i++) {
         X_arr_data[i] = X[i];
@@ -157,25 +167,26 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     
     double* A = (double*)PyArray_DATA(A_arr);
     
-    // Integration loop (leapfrog)
+    // Main leapfrog integration loop
     for (int step = 0; step < n_step; step++) {
         double t = step * dt;
         
-        // V(t+dt/2) = V(t) + A(t) * dt/2
+        // Leapfrog step 1: V(t+dt/2) = V(t) + A(t)*dt/2
         for (int i = 0; i < N * 3; i++) {
             V[i] += A[i] * dt / 2.0;
         }
         
-        // X(t+dt) = X(t) + V(t+dt/2) * dt
+        // Leapfrog step 2: X(t+dt) = X(t) + V(t+dt/2)*dt
         for (int i = 0; i < N * 3; i++) {
             X[i] += V[i] * dt;
         }
         
-        // A(t+dt) - update positions in numpy array and call accel
+        // Update positions in numpy array for accel calculation
         for (int i = 0; i < N * 3; i++) {
             X_arr_data[i] = X[i];
         }
         
+        // Compute A(t+dt) at new positions
         Py_DECREF(A_arr);
         A_arr = call_get_accel(X_arr, M_arr_np);
         if (!A_arr) {
@@ -186,12 +197,12 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         }
         A = (double*)PyArray_DATA(A_arr);
         
-        // V(t+dt) = V(t+dt/2) + A(t+dt) * dt/2
+        // Leapfrog step 3: V(t+dt) = V(t+dt/2) + A(t+dt)*dt/2
         for (int i = 0; i < N * 3; i++) {
             V[i] += A[i] * dt / 2.0;
         }
         
-        // Compute energies
+        // Compute kinetic energy for each particle: KE = 0.5*m*v^2
         std::vector<double> KE(N);
         std::vector<double> PE(N, 0.0);
         
@@ -200,6 +211,9 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
             KE[i] = 0.5 * M[i] * v2;
         }
         
+        // Compute potential energy for each particle
+        // PE_ij = -G*m_i*m_j / r_ij
+        // Each particle gets half of each pair interaction to avoid double counting
         for (int i = 0; i < N; i++) {
             for (int j = i+1; j < N; j++) {
                 double dx = X[i*3+0] - X[j*3+0];
@@ -212,24 +226,24 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
             }
         }
         
-        // Store results
+        // Store results for this timestep
         for (int i = 0; i < N; i++) {
             int row = step * N + i;
-            results_data[row*11 + 0] = sim_id;
-            results_data[row*11 + 1] = t / yr;
-            results_data[row*11 + 2] = i;
-            results_data[row*11 + 3] = X[i*3 + 0];
-            results_data[row*11 + 4] = X[i*3 + 1];
-            results_data[row*11 + 5] = X[i*3 + 2];
-            results_data[row*11 + 6] = V[i*3 + 0];
-            results_data[row*11 + 7] = V[i*3 + 1];
-            results_data[row*11 + 8] = V[i*3 + 2];
-            results_data[row*11 + 9] = KE[i];
-            results_data[row*11 + 10] = PE[i];
+            results_data[row*11 + 0] = sim_id;           // simulation ID
+            results_data[row*11 + 1] = t / yr;           // time in years
+            results_data[row*11 + 2] = i;                // particle index
+            results_data[row*11 + 3] = X[i*3 + 0];       // x position
+            results_data[row*11 + 4] = X[i*3 + 1];       // y position
+            results_data[row*11 + 5] = X[i*3 + 2];       // z position
+            results_data[row*11 + 6] = V[i*3 + 0];       // x velocity
+            results_data[row*11 + 7] = V[i*3 + 1];       // y velocity
+            results_data[row*11 + 8] = V[i*3 + 2];       // z velocity
+            results_data[row*11 + 9] = KE[i];            // kinetic energy
+            results_data[row*11 + 10] = PE[i];           // potential energy
         }
     }
     
-    // Clean up
+    // Clean up numpy arrays
     Py_DECREF(X_arr);
     Py_DECREF(M_arr_np);
     Py_DECREF(A_arr);
@@ -237,12 +251,14 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     return (PyObject*)results;
 }
 
+// Python module method definitions
 static PyMethodDef simulator_methods[] = {
     {"run_simulation", run_simulation, METH_VARARGS, 
-     "Run a single N-body simulation with perturbations"},
+     "Run a single N-body simulation"},
     {nullptr, nullptr, 0, nullptr}
 };
 
+// Python module definition
 static struct PyModuleDef simulator_module = {
     PyModuleDef_HEAD_INIT,
     "simulator",
@@ -255,7 +271,8 @@ static struct PyModuleDef simulator_module = {
     nullptr
 };
 
+// Module initialization function called by Python
 PyMODINIT_FUNC PyInit_simulator(void) {
-    import_array();
+    import_array();  // required for numpy C API
     return PyModule_Create(&simulator_module);
 }
