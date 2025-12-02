@@ -8,6 +8,7 @@
 #include <Python.h>
 #include <numpy/arrayobject.h>
 #include <cmath>
+#include <omp.h>
 
 #define G 6.67259e-8L  // [cm^3/g/s^2]
 
@@ -49,6 +50,7 @@ static PyObject* get_accel([[maybe_unused]] PyObject* self, PyObject* args) {
     double* M_in = (double*)PyArray_DATA(M_arr);
     double* A = (double*)PyArray_DATA(A_arr);
     
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < N; i++) {
         // Use long double for all internal calculations
         long double ax = 0.0L, ay = 0.0L, az = 0.0L;
@@ -93,16 +95,23 @@ static PyObject* get_accel([[maybe_unused]] PyObject* self, PyObject* args) {
     return (PyObject*)A_arr;
 }
 
+static PyObject* get_num_threads([[maybe_unused]] PyObject* self, [[maybe_unused]] PyObject* args) {
+    int max_threads = omp_get_max_threads();
+    return PyLong_FromLong(max_threads);
+}
+
 static PyMethodDef accel_methods[] = {
     {"get_accel", get_accel, METH_VARARGS, 
      "Compute gravitational acceleration for N bodies"},
+    {"get_num_threads", get_num_threads, METH_NOARGS,
+     "Get maximum number of OpenMP threads available"},
     {nullptr, nullptr, 0, nullptr}
 };
 
 static struct PyModuleDef accel_module = {
     PyModuleDef_HEAD_INIT,
     "accel",
-    "N-body gravitational acceleration module (ultra precision)",
+    "N-body gravitational acceleration module",
     -1,
     accel_methods,
     nullptr,
@@ -112,6 +121,6 @@ static struct PyModuleDef accel_module = {
 };
 
 PyMODINIT_FUNC PyInit_accel(void) {
-    import_array();
+    import_array();  // required for numpy C API
     return PyModule_Create(&accel_module);
 }

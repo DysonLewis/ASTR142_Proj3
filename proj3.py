@@ -3,6 +3,7 @@ import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
 from simulator import run_simulation
+import accel
 
 # Physical constants in CGS units
 AU = 1.496e13      # astronomical unit in cm
@@ -10,12 +11,22 @@ Msol = 1.989e33    # solar mass in grams
 yr = 3.15576e7     # year in seconds
 G = 6.6743e-8      # gravitational constant in cm^3 g^-1 s^-2
 
-# Get simulation parameters from user
-N = int(input("Enter number of particles: "))
-sphere_radius = float(input("Enter sphere radius [AU]: ")) * AU
-total_mass = float(input("Enter total system mass [solar masses]: ")) * Msol
-n_years = float(input("Enter simulation time [years]: "))
-n_simulations = int(input("Enter number of simulations to run: "))
+num_threads = accel.get_num_threads()
+print(f"OpenMP threads available: {num_threads}")
+
+
+N = int(1e3)
+sphere_radius = float(10) * AU
+total_mass = float(0.1) * Msol
+n_years = float(10)
+n_simulations = int(1)
+
+# # Get simulation parameters from user
+# N = int(input("Enter number of particles: "))
+# sphere_radius = float(input("Enter sphere radius [AU]: ")) * AU
+# total_mass = float(input("Enter total system mass [solar masses]: ")) * Msol
+# n_years = float(input("Enter simulation time [years]: "))
+# n_simulations = int(input("Enter number of simulations to run: "))
 
 # Calculate derived parameters
 particle_mass = total_mass / N  # each particle has equal mass

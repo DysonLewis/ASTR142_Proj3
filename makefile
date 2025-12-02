@@ -7,17 +7,18 @@ PYTHON_INCLUDE := $(shell $(PYTHON_CONFIG) --includes)
 PYTHON_LDFLAGS := $(shell $(PYTHON_CONFIG) --ldflags --embed 2>/dev/null || $(PYTHON_CONFIG) --ldflags)
 
 CXX := g++
-CXXFLAGS := -std=c++23 -O3 -fPIC -Wall -Wextra -pedantic
+CXXFLAGS := -std=c++23 -O3 -fPIC -Wall -Wextra -pedantic -fopenmp
 INCLUDES := $(PYTHON_INCLUDE) -I$(NUMPY_INCLUDE)
+LDFLAGS_COMMON := -fopenmp
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
     EXT_SUFFIX := $(shell $(PYTHON_CONFIG) --extension-suffix)
-    LDFLAGS := -shared
+    LDFLAGS := -shared $(LDFLAGS_COMMON)
 endif
 ifeq ($(UNAME_S),Darwin)
     EXT_SUFFIX := $(shell $(PYTHON_CONFIG) --extension-suffix)
-    LDFLAGS := -bundle -undefined dynamic_lookup
+    LDFLAGS := -bundle -undefined dynamic_lookup $(LDFLAGS_COMMON)
 endif
 
 TARGET_ACCEL := accel$(EXT_SUFFIX)
