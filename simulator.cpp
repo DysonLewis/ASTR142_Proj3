@@ -62,6 +62,75 @@ static PyArrayObject* call_get_accel(PyArrayObject* X_arr, PyArrayObject* M_arr)
 }
 
 /*
+Handle elastic collisions between particles.
+Detects when particles are closer than collision_radius and applies elastic collision physics.
+
+Args:
+    X: positions vector (flattened)
+    V: velocities vector (flattened)
+    M: masses vector
+    N: number of particles
+    collision_radius: minimum distance before collision handling
+*/
+static void handle_collisions(std::vector<double>& X, std::vector<double>& V, 
+                             const std::vector<double>& M, int N, double collision_radius) {
+    for (int i = 0; i < N; i++) {
+        for (int j = i+1; j < N; j++) {
+            double dx = X[i*3+0] - X[j*3+0];
+            double dy = X[i*3+1] - X[j*3+1];
+            double dz = X[i*3+2] - X[j*3+2];
+            double r = std::sqrt(dx*dx + dy*dy + dz*dz);
+            
+            if (r < collision_radius) {
+                // Collision normal vector
+                double nx = dx / r;
+                double ny = dy / r;
+                double nz = dz / r;
+                
+                // Relative velocity
+                double v_rel_x = V[i*3+0] - V[j*3+0];
+                double v_rel_y = V[i*3+1] - V[j*3+1];
+                double v_rel_z = V[i*3+2] - V[j*3+2];
+                
+                // Relative velocity along normal
+                double v_rel_n = v_rel_x*nx + v_rel_y*ny + v_rel_z*nz;
+                
+                // Only apply collision if particles are approaching
+                if (v_rel_n < 0) {
+                    double m_i = M[i];
+                    double m_j = M[j];
+                    double m_total = m_i + m_j;
+                    
+                    // Elastic collision impulse
+                    double impulse = 2.0 * m_i * m_j * v_rel_n / m_total;
+                    
+                    // Apply impulse to velocities
+                    V[i*3+0] -= (impulse / m_i) * nx;
+                    V[i*3+1] -= (impulse / m_i) * ny;
+                    V[i*3+2] -= (impulse / m_i) * nz;
+                    
+                    V[j*3+0] += (impulse / m_j) * nx;
+                    V[j*3+1] += (impulse / m_j) * ny;
+                    V[j*3+2] += (impulse / m_j) * nz;
+                    
+                    // Separate overlapping particles
+                    double overlap = collision_radius - r;
+                    double separation = overlap / 2.0 + 1e-10;
+                    
+                    X[i*3+0] += separation * nx;
+                    X[i*3+1] += separation * ny;
+                    X[i*3+2] += separation * nz;
+                    
+                    X[j*3+0] -= separation * nx;
+                    X[j*3+1] -= separation * ny;
+                    X[j*3+2] -= separation * nz;
+                }
+            }
+        }
+    }
+}
+
+/*
 Run a single N-body simulation using leapfrog integration.
 
 Args:
@@ -75,6 +144,7 @@ Args:
     n_step: number of timesteps
     dt: timestep in seconds
     yr: conversion factor from seconds to years
+    collision_radius: minimum distance for collision detection
     
 Returns:
     (n_step*N) x 11 numpy array containing:
@@ -89,9 +159,9 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     PyArrayObject* perturb_vel_arr = nullptr;
     
     int sim_id, n_step;
-    double dt, yr;
+    double dt, yr, collision_radius;
     
-    if (!PyArg_ParseTuple(args, "O!O!O!O!O!O!iidd",
+    if (!PyArg_ParseTuple(args, "O!O!O!O!O!O!iiddd",
                           &PyArray_Type, &X0_arr,
                           &PyArray_Type, &V0_arr,
                           &PyArray_Type, &M_arr,
@@ -101,7 +171,8 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
                           &sim_id,
                           &n_step,
                           &dt,
-                          &yr)) {
+                          &yr,
+                          &collision_radius)) {
         return nullptr;
     }
     
@@ -188,6 +259,9 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         for (int i = 0; i < N * 3; i++) {
             X[i] += V[i] * dt;
         }
+        
+        // Handle particle collisions
+        handle_collisions(X, V, M, N, collision_radius);
         
         // Update positions in numpy array for accel calculation
         #pragma omp parallel for schedule(static)
