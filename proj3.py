@@ -2,8 +2,10 @@ import numpy as np
 import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 from simulator import run_simulation
 import accel
+import os
 
 # Physical constants in CGS units
 AU = 1.496e13      # astronomical unit in cm
@@ -11,15 +13,18 @@ Msol = 1.989e33    # solar mass in grams
 yr = 3.15576e7     # year in seconds
 G = 6.6743e-8      # gravitational constant in cm^3 g^-1 s^-2
 
+plot_dir = '/home/dyson/fall25/ASTRO142_Proj3/plots'
+os.makedirs(plot_dir, exist_ok=True)
+
 num_threads = accel.get_num_threads()
 print(f"OpenMP threads available: {num_threads}")
 
-
-N = int(20)
+N = int(100)
 sphere_radius = float(0.001) * AU
-total_mass = float(1e-10) * Msol
+total_mass = float(1e-13) * Msol
 n_years = float(100)
 n_simulations = int(1)
+collision_radius_factor = 0.01
 
 # # Get simulation parameters from user
 # N = int(input("Enter number of particles: "))
@@ -32,10 +37,12 @@ n_simulations = int(1)
 particle_mass = total_mass / N  # each particle has equal mass
 dt = 0.01 * yr  # timestep for leapfrog integration
 n_step = int((n_years * yr) / dt)  # total number of timesteps
+collision_radius = collision_radius_factor * sphere_radius
 
 print(f"Particle mass: {particle_mass/Msol:.6e} solar masses")
 print(f"Time step: {dt/yr} years")
 print(f"Total steps: {n_step}")
+print(f"Collision radius: {collision_radius/AU:.6e} AU")
 
 def generate_sphere_particles(N, radius):
     '''
@@ -90,7 +97,8 @@ for sim in range(n_simulations):
         sim + 1,  # simulation ID
         n_step,
         dt,
-        yr
+        yr,
+        collision_radius
     )
     
     # Convert results array to DataFrame
@@ -115,8 +123,11 @@ print("\nAll simulations complete. Data saved to nbody_simulations.csv")
 fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
 first_sim = df[df["simulation"] == 1]
-plot_particles = min(10, N)  # plot up to 10 particles
+plot_particles = min(10, N)
+plot_radius_factor = 3.0
+plot_limit = plot_radius_factor * sphere_radius / AU
 
+# Plot data for each particle (inside the loop)
 for i in range(plot_particles):
     particle_df = first_sim[first_sim["body_idx"] == i]
     
@@ -128,13 +139,17 @@ for i in range(plot_particles):
     v = np.sqrt(particle_df["vx_cm_s"]**2 + particle_df["vy_cm_s"]**2 + particle_df["vz_cm_s"]**2)
     axes[0, 1].plot(particle_df["time_yr"], v/1e5, label=f"Particle {i}")
     
-    # Plot XY trajectory
-    axes[1, 0].plot(particle_df["x_cm"]/AU, particle_df["y_cm"]/AU, label=f"Particle {i}")
+    # Plot XY trajectory with color mapped to time
+    scatter = axes[1, 0].scatter(particle_df["x_cm"]/AU, particle_df["y_cm"]/AU, 
+                                  c=particle_df["time_yr"], cmap='viridis', 
+                                  s=2, alpha=0.6, label=f"Particle {i}")
     
     # Plot total energy vs time
     axes[1, 1].plot(particle_df["time_yr"], particle_df["E_tot"], label=f"Particle {i}")
 
+# Configure subplots AFTER the loop
 # Configure subplot 1: radial distance vs time
+axes[0, 0].axhline(y=sphere_radius/AU, color='k', linestyle='--', linewidth=1, label='Initial radius')
 axes[0, 0].set_xlabel("Time [yr]")
 axes[0, 0].set_ylabel("Radial Distance [AU]")
 axes[0, 0].set_title("Radial Distance vs Time")
@@ -147,11 +162,17 @@ axes[0, 1].set_title("Speed vs Time")
 axes[0, 1].legend(fontsize='small')
 
 # Configure subplot 3: XY trajectories
+circle = plt.Circle((0, 0), sphere_radius/AU, color='k', fill=False, linestyle='--', linewidth=1, label='Initial sphere')
+axes[1, 0].add_patch(circle)
 axes[1, 0].set_xlabel("X [AU]")
 axes[1, 0].set_ylabel("Y [AU]")
-axes[1, 0].set_title("XY Trajectories")
+axes[1, 0].set_title("XY Trajectories (colored by time)")
+axes[1, 0].axis('equal')
+axes[1, 0].set_xlim(-plot_limit, plot_limit)
+axes[1, 0].set_ylim(-plot_limit, plot_limit)
+# Add colorbar for time
+cbar = plt.colorbar(scatter, ax=axes[1, 0], label='Time [yr]')
 axes[1, 0].legend(fontsize='small')
-axes[1, 0].axis('equal')  # equal aspect ratio
 
 # Configure subplot 4: energy vs time
 axes[1, 1].set_xlabel("Time [yr]")
@@ -160,4 +181,5 @@ axes[1, 1].set_title("Total Energy vs Time")
 axes[1, 1].legend(fontsize='small')
 
 plt.tight_layout()
+# plt.savefig(os.path.join(plot_dir, f"particle_plot_N{N}_onplot{plot_particles}.png"), dpi=300, bbox_inches='tight')
 plt.show()
