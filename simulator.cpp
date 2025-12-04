@@ -10,6 +10,7 @@ Calls Python accel module for gravitational acceleration calculations
 #include <numpy/arrayobject.h>
 #include <cmath>
 #include <vector>
+#include <omp.h>
 
 #define G 6.6743e-8L  // gravitational constant in cm^3 g^-1 s^-2
 
@@ -115,10 +116,13 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     double* V0_data = (double*)PyArray_DATA(V0_arr);
     double* M_data = (double*)PyArray_DATA(M_arr);
     
+    // Parallelize initial data copying
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < N * 3; i++) {
         X[i] = X0_data[i];
         V[i] = V0_data[i];
     }
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < N; i++) {
         M[i] = M_data[i];
     }
@@ -147,12 +151,14 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     
     // Copy masses to numpy array (only need to do once since masses don't change)
     double* M_arr_data = (double*)PyArray_DATA(M_arr_np);
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < N; i++) {
         M_arr_data[i] = M[i];
     }
     
     // Copy initial positions and compute initial acceleration
     double* X_arr_data = (double*)PyArray_DATA(X_arr);
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < N * 3; i++) {
         X_arr_data[i] = X[i];
     }
@@ -172,16 +178,19 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         double t = step * dt;
         
         // Leapfrog step 1: V(t+dt/2) = V(t) + A(t)*dt/2
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < N * 3; i++) {
             V[i] += A[i] * dt / 2.0;
         }
         
         // Leapfrog step 2: X(t+dt) = X(t) + V(t+dt/2)*dt
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < N * 3; i++) {
             X[i] += V[i] * dt;
         }
         
         // Update positions in numpy array for accel calculation
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < N * 3; i++) {
             X_arr_data[i] = X[i];
         }
@@ -198,6 +207,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         A = (double*)PyArray_DATA(A_arr);
         
         // Leapfrog step 3: V(t+dt) = V(t+dt/2) + A(t+dt)*dt/2
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < N * 3; i++) {
             V[i] += A[i] * dt / 2.0;
         }
@@ -206,6 +216,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         std::vector<double> KE(N);
         std::vector<double> PE(N, 0.0);
         
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < N; i++) {
             double v2 = V[i*3+0]*V[i*3+0] + V[i*3+1]*V[i*3+1] + V[i*3+2]*V[i*3+2];
             KE[i] = 0.5 * M[i] * v2;
@@ -214,6 +225,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         // Compute potential energy for each particle
         // PE_ij = -G*m_i*m_j / r_ij
         // Each particle gets half of each pair interaction to avoid double counting
+        #pragma omp parallel for schedule(dynamic)
         for (int i = 0; i < N; i++) {
             for (int j = i+1; j < N; j++) {
                 double dx = X[i*3+0] - X[j*3+0];
@@ -221,12 +233,15 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
                 double dz = X[i*3+2] - X[j*3+2];
                 double r = std::sqrt(dx*dx + dy*dy + dz*dz);
                 double pe_term = -G * M[i] * M[j] / r;
+                #pragma omp atomic
                 PE[i] += pe_term;
+                #pragma omp atomic
                 PE[j] += pe_term;
             }
         }
         
         // Store results for this timestep
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < N; i++) {
             int row = step * N + i;
             results_data[row*11 + 0] = sim_id;           // simulation ID

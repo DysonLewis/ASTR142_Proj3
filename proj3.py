@@ -15,10 +15,10 @@ num_threads = accel.get_num_threads()
 print(f"OpenMP threads available: {num_threads}")
 
 
-N = int(1e3)
-sphere_radius = float(10) * AU
-total_mass = float(0.1) * Msol
-n_years = float(10)
+N = int(20)
+sphere_radius = float(0.001) * AU
+total_mass = float(1e-10) * Msol
+n_years = float(100)
 n_simulations = int(1)
 
 # # Get simulation parameters from user
