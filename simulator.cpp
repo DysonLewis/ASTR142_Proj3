@@ -11,6 +11,7 @@ Calls Python accel module for gravitational acceleration calculations
 #include <cmath>
 #include <vector>
 #include <omp.h>
+#include <deque>
 
 #define G 6.6743e-8L  // gravitational constant in cm^3 g^-1 s^-2
 
@@ -131,6 +132,36 @@ static void handle_collisions(std::vector<double>& X, std::vector<double>& V,
 }
 
 /*
+Check if system has reached virial equilibrium using moving average.
+Virial theorem: 2*KE + PE ≈ 0 at equilibrium
+Returns true if virial ratio is stable near 1.0
+
+Args:
+    virial_ratios: deque of recent virial ratio measurements
+    window_size: number of measurements to average
+    tolerance: acceptable deviation from ideal ratio
+*/
+static bool check_virial_equilibrium(const std::deque<double>& virial_ratios, 
+                                    int window_size, double tolerance) {
+    if ((int)virial_ratios.size() < window_size) {
+        return false;
+    }
+    
+    double sum = 0.0;
+    double sum_sq = 0.0;
+    for (int i = (int)virial_ratios.size() - window_size; i < (int)virial_ratios.size(); i++) {
+        sum += virial_ratios[i];
+        sum_sq += virial_ratios[i] * virial_ratios[i];
+    }
+    
+    double mean = sum / window_size;
+    double variance = (sum_sq / window_size) - (mean * mean);
+    double std_dev = std::sqrt(variance);
+    
+    return (std::abs(mean - 1.0) < tolerance) && (std_dev < tolerance);
+}
+
+/*
 Run a single N-body simulation using leapfrog integration.
 
 Args:
@@ -141,13 +172,13 @@ Args:
     perturb_pos_arr: unused (kept for compatibility)
     perturb_vel_arr: unused (kept for compatibility)
     sim_id: simulation identifier
-    n_step: number of timesteps
+    max_step: maximum number of timesteps
     dt: timestep in seconds
     yr: conversion factor from seconds to years
     collision_radius: minimum distance for collision detection
     
 Returns:
-    (n_step*N) x 11 numpy array containing:
+    (actual_steps*N) x 11 numpy array containing:
     [sim_id, time_yr, body_idx, x, y, z, vx, vy, vz, KE, PE]
 */
 static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args) {
@@ -158,7 +189,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     PyArrayObject* perturb_pos_arr = nullptr;
     PyArrayObject* perturb_vel_arr = nullptr;
     
-    int sim_id, n_step;
+    int sim_id, max_step;
     double dt, yr, collision_radius;
     
     if (!PyArg_ParseTuple(args, "O!O!O!O!O!O!iiddd",
@@ -169,7 +200,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
                           &PyArray_Type, &perturb_pos_arr,
                           &PyArray_Type, &perturb_vel_arr,
                           &sim_id,
-                          &n_step,
+                          &max_step,
                           &dt,
                           &yr,
                           &collision_radius)) {
@@ -198,13 +229,9 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         M[i] = M_data[i];
     }
     
-    // Allocate output array for results
-    npy_intp dims[2] = {(npy_intp)(n_step * N), 11};
-    PyArrayObject* results = (PyArrayObject*)PyArray_ZEROS(2, dims, NPY_DOUBLE, 0);
-    if (!results) {
-        return nullptr;
-    }
-    double* results_data = (double*)PyArray_DATA(results);
+    // Allocate temporary storage for results (will be trimmed later)
+    std::vector<std::vector<double>> results_buffer;
+    results_buffer.reserve(max_step * N);
     
     // Create numpy arrays for passing to accel module
     npy_intp pos_dims[2] = {N, 3};
@@ -216,7 +243,6 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     if (!X_arr || !M_arr_np) {
         Py_XDECREF(X_arr);
         Py_XDECREF(M_arr_np);
-        Py_DECREF(results);
         return nullptr;
     }
     
@@ -238,14 +264,22 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     if (!A_arr) {
         Py_DECREF(X_arr);
         Py_DECREF(M_arr_np);
-        Py_DECREF(results);
         return nullptr;
     }
     
     double* A = (double*)PyArray_DATA(A_arr);
     
+    // Virial equilibrium tracking
+    std::deque<double> virial_ratios;
+    const int check_interval = 100;
+    const int window_size = 100;
+    const double tolerance = 0.05;
+    const int min_steps = 1000;
+    bool equilibrium_reached = false;
+    int actual_steps = 0;
+    
     // Main leapfrog integration loop
-    for (int step = 0; step < n_step; step++) {
+    for (int step = 0; step < max_step; step++) {
         double t = step * dt;
         
         // Leapfrog step 1: V(t+dt/2) = V(t) + A(t)*dt/2
@@ -275,7 +309,6 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         if (!A_arr) {
             Py_DECREF(X_arr);
             Py_DECREF(M_arr_np);
-            Py_DECREF(results);
             return nullptr;
         }
         A = (double*)PyArray_DATA(A_arr);
@@ -298,7 +331,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         
         // Compute potential energy for each particle
         // PE_ij = -G*m_i*m_j / r_ij
-        // Each particle gets half of each pair interaction to avoid double counting
+        // Each particle gets half of each pair interaction to avoid double counting when summing
         #pragma omp parallel for schedule(dynamic)
         for (int i = 0; i < N; i++) {
             for (int j = i+1; j < N; j++) {
@@ -308,27 +341,54 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
                 double r = std::sqrt(dx*dx + dy*dy + dz*dz);
                 double pe_term = -G * M[i] * M[j] / r;
                 #pragma omp atomic
-                PE[i] += pe_term;
+                PE[i] += pe_term * 0.5;
                 #pragma omp atomic
-                PE[j] += pe_term;
+                PE[j] += pe_term * 0.5;
             }
         }
         
         // Store results for this timestep
-        #pragma omp parallel for schedule(static)
         for (int i = 0; i < N; i++) {
-            int row = step * N + i;
-            results_data[row*11 + 0] = sim_id;           // simulation ID
-            results_data[row*11 + 1] = t / yr;           // time in years
-            results_data[row*11 + 2] = i;                // particle index
-            results_data[row*11 + 3] = X[i*3 + 0];       // x position
-            results_data[row*11 + 4] = X[i*3 + 1];       // y position
-            results_data[row*11 + 5] = X[i*3 + 2];       // z position
-            results_data[row*11 + 6] = V[i*3 + 0];       // x velocity
-            results_data[row*11 + 7] = V[i*3 + 1];       // y velocity
-            results_data[row*11 + 8] = V[i*3 + 2];       // z velocity
-            results_data[row*11 + 9] = KE[i];            // kinetic energy
-            results_data[row*11 + 10] = PE[i];           // potential energy
+            std::vector<double> row(11);
+            row[0] = sim_id;
+            row[1] = t / yr;
+            row[2] = i;
+            row[3] = X[i*3 + 0];
+            row[4] = X[i*3 + 1];
+            row[5] = X[i*3 + 2];
+            row[6] = V[i*3 + 0];
+            row[7] = V[i*3 + 1];
+            row[8] = V[i*3 + 2];
+            row[9] = KE[i];
+            row[10] = PE[i];
+            results_buffer.push_back(row);
+        }
+        
+        actual_steps = step + 1;
+        
+        // Check virial equilibrium every check_interval steps
+        if (step % check_interval == 0 && step >= min_steps) {
+            double total_KE = 0.0;
+            double total_PE = 0.0;
+            
+            for (int i = 0; i < N; i++) {
+                total_KE += KE[i];
+                total_PE += PE[i];
+            }
+            
+            if (std::abs(total_PE) > 1e-30) {
+                double virial_ratio = std::abs(2.0 * total_KE / total_PE);
+                virial_ratios.push_back(virial_ratio);
+                
+                if (virial_ratios.size() > (size_t)(window_size * 2)) {
+                    virial_ratios.pop_front();
+                }
+                
+                if (check_virial_equilibrium(virial_ratios, window_size, tolerance)) {
+                    equilibrium_reached = true;
+                    break;
+                }
+            }
         }
     }
     
@@ -336,6 +396,29 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     Py_DECREF(X_arr);
     Py_DECREF(M_arr_np);
     Py_DECREF(A_arr);
+    
+    // Create output array with actual size
+    npy_intp dims[2] = {(npy_intp)(actual_steps * N), 11};
+    PyArrayObject* results = (PyArrayObject*)PyArray_ZEROS(2, dims, NPY_DOUBLE, 0);
+    if (!results) {
+        return nullptr;
+    }
+    double* results_data = (double*)PyArray_DATA(results);
+    
+    // Copy buffered results to output array
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < actual_steps * N; i++) {
+        for (int j = 0; j < 11; j++) {
+            results_data[i*11 + j] = results_buffer[i][j];
+        }
+    }
+    
+    if (equilibrium_reached) {
+        printf("Virial equilibrium reached at step %d (%.2f years)\n", 
+               actual_steps, actual_steps * dt / yr);
+    } else {
+        printf("Maximum steps reached without achieving virial equilibrium\n");
+    }
     
     return (PyObject*)results;
 }
