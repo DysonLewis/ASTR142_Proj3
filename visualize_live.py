@@ -26,7 +26,7 @@ class SimulationVisualizer:
         Args:
             data_df: pandas DataFrame with simulation data
             sphere_radius: initial sphere radius in cm
-            visualization_interval: only display every Nth timestep from data
+            visualization_interval: UNUSED - kept for compatibility
             trail_length: number of historical positions to keep per particle
             target_fps: target frames per second for animation
             window_width: total window width in pixels
@@ -35,17 +35,15 @@ class SimulationVisualizer:
         self.data_df = data_df
         self.sphere_radius = sphere_radius
         self.N = len(data_df['body_idx'].unique())
-        self.visualization_interval = visualization_interval
         self.trail_length = trail_length
         self.target_fps = target_fps
         self.window_width = window_width
         self.window_height = window_height
         
-        # Get unique time points and subsample by visualization_interval
-        all_time_points = sorted(data_df['time_yr'].unique())
-        self.time_points = all_time_points[::visualization_interval]
-        self.n_frames = len(self.time_points)
-        self.current_frame = 0
+        # Get ALL unique time points (no subsampling - we'll dynamically choose based on speed)
+        self.all_time_points = sorted(data_df['time_yr'].unique())
+        self.n_total_frames = len(self.all_time_points)
+        self.current_time_index = 0
         
         # Trail data: each particle has deque of (x, y) positions
         self.particle_trails = [deque(maxlen=trail_length) for _ in range(self.N)]
@@ -53,9 +51,13 @@ class SimulationVisualizer:
         # Particle colors: use colormap for distinct colors
         self.colors = plt.cm.tab10(np.linspace(0, 1, self.N))
         
+        # Playback control - speed in years per second
+        self.years_per_second = 1.0  # Start at 1 year per second
+        self.last_real_time = time.time()
+        self.accumulated_sim_time = 0.0  # How much simulation time we should have shown
+        
         # Playback control
         self.paused = False
-        self.speed_multiplier = 0.0  # 0.0 = 1x speed, 1.0 = unlimited
         
         # FPS tracking
         self.frame_times = deque(maxlen=30)
@@ -151,23 +153,25 @@ class SimulationVisualizer:
         
         # Speed control slider (bottom panel, spans both columns)
         self.ax_slider = self.fig.add_subplot(gs[1, :])
-        self.ax_slider.set_title("Playback Speed Control", fontsize=10)
+        self.ax_slider.set_title("Playback Speed Control (years per second)", fontsize=10)
         
-        # Create slider: 0.0 (1x speed) to 1.0 (unlimited speed)
+        # Create slider: logarithmic scale from 1 yr/s to 1000 yr/s
+        # Slider value is log10(years_per_second), so 0.0 = 1 yr/s, 3.0 = 1000 yr/s
         self.speed_slider = Slider(
             ax=self.ax_slider,
             label='Speed',
             valmin=0.0,
-            valmax=1.0,
+            valmax=3.0,
             valinit=0.0,
-            valstep=0.05,
             color='skyblue'
         )
         
         # Custom slider labels
-        self.ax_slider.text(0.0, -0.5, '1x', transform=self.ax_slider.transAxes, 
+        self.ax_slider.text(0.0, -0.5, '1 yr/s', transform=self.ax_slider.transAxes, 
                            ha='left', va='top', fontsize=9)
-        self.ax_slider.text(1.0, -0.5, 'Unlimited', transform=self.ax_slider.transAxes,
+        self.ax_slider.text(0.5, -0.5, '~32 yr/s', transform=self.ax_slider.transAxes,
+                           ha='center', va='top', fontsize=9)
+        self.ax_slider.text(1.0, -0.5, '1000 yr/s', transform=self.ax_slider.transAxes,
                            ha='right', va='top', fontsize=9)
         
         # Connect slider to callback
@@ -178,9 +182,9 @@ class SimulationVisualizer:
         Callback for speed slider changes.
         
         Args:
-            val: slider value from 0.0 (1x) to 1.0 (unlimited)
+            val: slider value (log10 of years per second)
         """
-        self.speed_multiplier = val
+        self.years_per_second = 10.0 ** val
         
     def _calculate_fps(self):
         """
@@ -263,18 +267,39 @@ class SimulationVisualizer:
         """
         Animation update function called by FuncAnimation.
         
-        Advances through pre-computed simulation data.
+        Advances through pre-computed simulation data based on real time elapsed
+        and current speed setting.
         
         Args:
-            frame_num: frame number from FuncAnimation
+            frame_num: frame number from FuncAnimation (unused - we track time ourselves)
         """
         # Check if we've reached the end
-        if self.current_frame >= self.n_frames:
+        if self.current_time_index >= self.n_total_frames - 1:
             return [self.particle_scatter, self.virial_indicator, 
                     self.virial_text, self.stats_text] + self.trail_collections
         
+        # Calculate how much real time has passed
+        current_real_time = time.time()
+        real_dt = current_real_time - self.last_real_time
+        self.last_real_time = current_real_time
+        
+        # Calculate how much simulation time should have passed
+        sim_dt = real_dt * self.years_per_second
+        self.accumulated_sim_time += sim_dt
+        
+        # Find the time index we should be at
+        target_sim_time = self.all_time_points[0] + self.accumulated_sim_time
+        
+        # Find closest time point in data (binary search would be better but this works)
+        while (self.current_time_index < self.n_total_frames - 1 and 
+               self.all_time_points[self.current_time_index] < target_sim_time):
+            self.current_time_index += 1
+        
+        # Clamp to valid range
+        self.current_time_index = min(self.current_time_index, self.n_total_frames - 1)
+        
         # Get data for current time point
-        current_time = self.time_points[self.current_frame]
+        current_time = self.all_time_points[self.current_time_index]
         frame_data = self.data_df[self.data_df['time_yr'] == current_time]
         
         # Extract positions and energies
@@ -301,17 +326,11 @@ class SimulationVisualizer:
         
         # Update stats text
         fps = self._calculate_fps()
-        stats_str = f"Time: {current_time:.1f} yr\nFPS: {fps:.1f}\nFrame: {self.current_frame+1}/{self.n_frames}"
+        stats_str = (f"Time: {current_time:.1f} yr\n"
+                    f"Speed: {self.years_per_second:.1f} yr/s\n"
+                    f"FPS: {fps:.1f}\n"
+                    f"Frame: {self.current_time_index+1}/{self.n_total_frames}")
         self.stats_text.set_text(stats_str)
-        
-        # Apply speed control delay
-        if self.speed_multiplier < 0.99:
-            base_delay = 1.0 / self.target_fps
-            delay = base_delay * (1.0 - self.speed_multiplier)
-            time.sleep(delay)
-        
-        # Advance to next frame
-        self.current_frame += 1
         
         return [self.particle_scatter, self.virial_indicator, 
                 self.virial_text, self.stats_text] + self.trail_collections
@@ -322,9 +341,12 @@ class SimulationVisualizer:
         """
         from matplotlib.animation import FuncAnimation
         
+        # Initialize timing
+        self.last_real_time = time.time()
+        self.accumulated_sim_time = 0.0
+        
         # Create animation with target FPS
         self.anim = FuncAnimation(self.fig, self.update_frame,
-                                 frames=self.n_frames,
                                  interval=1000/self.target_fps,
                                  blit=True, 
                                  repeat=False,

@@ -28,14 +28,13 @@ TRAIL_LENGTH = 50  # Number of historical positions to keep per particle
 TARGET_FPS = 30    # Target frames per second for animation
 WINDOW_WIDTH = 1400  # Total window width in pixels
 WINDOW_HEIGHT = 800  # Total window height in pixels
-TARGET_VISUALIZATION_FRAMES = 3000  # Target number of frames for visualization playback
 
 # Hardcoded parameters, these seem to give a good chance of virial equilibrium 
-N = int(4)
+N = int(10)
 sphere_radius = float(0.001) * AU
-total_mass = float(1e-15) * Msol
+total_mass = float(1e-16) * Msol
 max_years = float(10000)
-n_simulations = int(1)
+n_simulations = int(3)
 collision_radius_factor = 0.01
 
 # # Get simulation parameters from user
@@ -51,9 +50,6 @@ dt = 0.01 * yr
 max_step = int((max_years * yr) / dt)
 collision_radius = collision_radius_factor * sphere_radius
 
-# Calculate visualization interval to get ~TARGET_VISUALIZATION_FRAMES frames
-visualization_interval = max(1, max_step // TARGET_VISUALIZATION_FRAMES)
-
 print("=" * 60)
 print("N-body simulation")
 print("=" * 60)
@@ -66,8 +62,6 @@ print(f"Timestep: {dt/yr:.4f} years")
 print(f"Maximum steps: {max_step}")
 print(f"Simulation duration: {max_years} years")
 print(f"Number of simulations: {n_simulations}")
-print(f"Visualization interval: every {visualization_interval} steps")
-print(f"Expected visualization frames: ~{max_step // visualization_interval}")
 print("=" * 60)
 
 
@@ -334,7 +328,6 @@ def main():
     visualizer = SimulationVisualizer(
         df_sim1, 
         sphere_radius,
-        visualization_interval=visualization_interval,
         trail_length=TRAIL_LENGTH,
         target_fps=TARGET_FPS,
         window_width=WINDOW_WIDTH,
