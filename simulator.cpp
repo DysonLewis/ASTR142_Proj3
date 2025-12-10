@@ -271,10 +271,10 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     
     // Virial equilibrium tracking
     std::deque<double> virial_ratios;
-    const int check_interval = 100;
-    const int window_size = 100;
-    const double tolerance = 0.05;
-    const int min_steps = 1000;
+    const int check_interval = 100;     // how often it checks for stability
+    const int window_size = 200;        // how many step it averages over for stability to be true
+    const double tolerance = 0.05;      // precent deviation
+    const int min_steps = 1000;         // minimum runtime before checking
     bool equilibrium_reached = false;
     int actual_steps = 0;
     

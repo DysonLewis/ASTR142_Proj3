@@ -6,6 +6,8 @@ import matplotlib.cm as cm
 from simulator import run_simulation
 import accel
 import os
+from astropy.io import fits
+from astropy.table import Table
 
 # Physical constants in CGS units
 AU = 1.496e13      # astronomical unit in cm
@@ -73,6 +75,7 @@ def generate_sphere_particles(N, radius):
     return positions, velocities
 
 all_dfs = []
+hdu_list = []
 
 for sim in range(n_simulations):
     print(f"\nSimulation {sim+1}/{n_simulations}")
@@ -105,10 +108,37 @@ for sim in range(n_simulations):
     
     df_sim["E_tot"] = df_sim["KE"] + df_sim["PE"]
     all_dfs.append(df_sim)
+    
+    # Convert DataFrame to astropy Table for FITS
+    table = Table.from_pandas(df_sim)
+    
+    # Create BinTableHDU for this simulation
+    if sim == 0:
+        # First extension becomes primary HDU with header info
+        primary_hdu = fits.PrimaryHDU()
+        primary_hdu.header['N_BODIES'] = N
+        primary_hdu.header['SPHRAD'] = (sphere_radius, 'Initial sphere radius [cm]')
+        primary_hdu.header['TOTMASS'] = (total_mass, 'Total system mass [g]')
+        primary_hdu.header['DT'] = (dt, 'Timestep [s]')
+        primary_hdu.header['MAXSTEP'] = max_step
+        primary_hdu.header['COLLRAD'] = (collision_radius, 'Collision radius [cm]')
+        primary_hdu.header['NSIMS'] = n_simulations
+        hdu_list.append(primary_hdu)
+    
+    # Create table HDU for this simulation's data
+    table_hdu = fits.BinTableHDU(table)
+    table_hdu.header['SIMID'] = (sim + 1, 'Simulation ID number')
+    table_hdu.header['EXTNAME'] = f'SIM_{sim+1}'
+    hdu_list.append(table_hdu)
 
+# Create HDUList and write to file
+hdul = fits.HDUList(hdu_list)
+fits_filename = 'nbody_simulations.fits'
+hdul.writeto(fits_filename, overwrite=True)
+print(f"\nAll simulations complete. Data saved to {fits_filename}")
+
+# Concatenate all dataframes for plotting
 df = pd.concat(all_dfs, ignore_index=True)
-df.to_csv("nbody_simulations.csv", index=False)
-print("\nAll simulations complete. Data saved to nbody_simulations.csv")
 
 first_sim = df[df["simulation"] == 1]
 plot_particles = min(10, N)
@@ -161,6 +191,7 @@ axes1[1, 1].set_title("Total Energy vs Time")
 axes1[1, 1].legend(fontsize='small')
 
 plt.tight_layout()
+plt.savefig(os.path.join(plot_dir, f"system_of_{N}_particles.png"), dpi=300, bbox_inches='tight')
 plt.show()
 
 # Second figure: system-level plots (1x2)
@@ -193,4 +224,5 @@ axes2[1].grid(True, alpha=0.3)
 axes2[1].set_ylim(0, 2.5)
 
 plt.tight_layout()
+plt.savefig(os.path.join(plot_dir, f"Virial_for_{N}_particles.png"), dpi=300, bbox_inches='tight')
 plt.show()
