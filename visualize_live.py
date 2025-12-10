@@ -4,61 +4,65 @@ import matplotlib.patches as patches
 from matplotlib.widgets import Slider
 from matplotlib.collections import LineCollection
 from collections import deque
-import queue
-import threading
 import time
 
 # Physical constants in CGS units
 AU = 1.496e13      # astronomical unit in cm
-Msol = 1.989e33    # solar mass in grams
-yr = 3.15576e7     # year in seconds
-
-# Visualization parameters
-TRAIL_LENGTH = 50  # Number of historical positions to keep per particle
-TARGET_FPS = 30      # Target frames per second for animation
-WINDOW_WIDTH = 1400  # Total window width in pixels
-WINDOW_HEIGHT = 800  # Total window height in pixels
 
 
-class LiveSimulationVisualizer:
+class SimulationVisualizer:
     """
-    Real-time N-body simulation visualizer with fading particle trails.
+    Playback visualizer for pre-computed N-body simulation data.
     
     Displays particles in XY plane with trailing motion blur effect and
     a virial ratio indicator bar showing system energy balance.
     """
     
-    def __init__(self, N, sphere_radius, data_queue):
+    def __init__(self, data_df, sphere_radius, visualization_interval=1, trail_length=50, 
+                 target_fps=30, window_width=1400, window_height=800):
         """
         Initialize the visualization window and data structures.
         
         Args:
-            N: number of particles in simulation
+            data_df: pandas DataFrame with simulation data
             sphere_radius: initial sphere radius in cm
-            data_queue: thread-safe queue receiving simulation frames
+            visualization_interval: only display every Nth timestep from data
+            trail_length: number of historical positions to keep per particle
+            target_fps: target frames per second for animation
+            window_width: total window width in pixels
+            window_height: total window height in pixels
         """
-        self.N = N
+        self.data_df = data_df
         self.sphere_radius = sphere_radius
-        self.data_queue = data_queue
+        self.N = len(data_df['body_idx'].unique())
+        self.visualization_interval = visualization_interval
+        self.trail_length = trail_length
+        self.target_fps = target_fps
+        self.window_width = window_width
+        self.window_height = window_height
+        
+        # Get unique time points and subsample by visualization_interval
+        all_time_points = sorted(data_df['time_yr'].unique())
+        self.time_points = all_time_points[::visualization_interval]
+        self.n_frames = len(self.time_points)
+        self.current_frame = 0
         
         # Trail data: each particle has deque of (x, y) positions
-        self.particle_trails = [deque(maxlen=TRAIL_LENGTH) for _ in range(N)]
+        self.particle_trails = [deque(maxlen=trail_length) for _ in range(self.N)]
         
         # Particle colors: use colormap for distinct colors
-        self.colors = plt.cm.tab10(np.linspace(0, 1, N))
+        self.colors = plt.cm.tab10(np.linspace(0, 1, self.N))
         
-        # Current simulation state
-        self.current_time = 0.0  # years
-        self.current_virial = 1.0  # virial ratio
+        # Playback control
         self.paused = False
-        self.speed_multiplier = 1.0  # Speed control (1.0 = normal, 0.0 = unlimited)
+        self.speed_multiplier = 0.0  # 0.0 = 1x speed, 1.0 = unlimited
         
         # FPS tracking
-        self.frame_times = deque(maxlen=30)  # Store last 30 frame timestamps
+        self.frame_times = deque(maxlen=30)
         self.last_frame_time = time.time()
         
         # Plot limits (auto-scale based on initial sphere)
-        self.plot_limit = 2.0 * sphere_radius / AU  # Show 2x initial radius
+        self.plot_limit = 2.0 * sphere_radius / AU
         
         self._setup_figure()
         
@@ -67,7 +71,7 @@ class LiveSimulationVisualizer:
         Create the matplotlib figure with two panels: XY plot and virial bar.
         """
         # Create figure with custom size
-        self.fig = plt.figure(figsize=(WINDOW_WIDTH/100, WINDOW_HEIGHT/100), dpi=100)
+        self.fig = plt.figure(figsize=(self.window_width/100, self.window_height/100), dpi=100)
         
         # Create grid: main plot takes 85% width, virial bar takes 15%
         gs = self.fig.add_gridspec(2, 2, width_ratios=[85, 15], height_ratios=[9, 1],
@@ -97,12 +101,10 @@ class LiveSimulationVisualizer:
             self.ax_xy.add_collection(lc)
             self.trail_collections.append(lc)
         
-        # Current particle positions (scatter plot) - initialize with dummy point
-        # Will be updated with real positions in first frame
-        self.particle_scatter = self.ax_xy.scatter([0], [0], s=30, c=[self.colors[0]], 
+        # Current particle positions (scatter plot)
+        self.particle_scatter = self.ax_xy.scatter([], [], s=30, c=[self.colors[0]], 
                                                    edgecolors='black', linewidths=1.5,
                                                    zorder=10, label='Particles')
-        # Make initial point invisible
         self.particle_scatter.set_offsets(np.empty((0, 2)))
         
         # Stats text overlay (top-left corner)
@@ -115,10 +117,10 @@ class LiveSimulationVisualizer:
         # Right panel: Virial ratio bar
         self.ax_virial = self.fig.add_subplot(gs[0, 1])
         self.ax_virial.set_xlim(0, 1)
-        self.ax_virial.set_ylim(0.5, 1.5)  # Virial ratio range
+        self.ax_virial.set_ylim(0.5, 1.5)
         self.ax_virial.set_ylabel("Virial Ratio |2KE/PE|", fontsize=12)
         self.ax_virial.set_title("Energy Balance", fontsize=12, fontweight='bold')
-        self.ax_virial.set_xticks([])  # No x-ticks needed
+        self.ax_virial.set_xticks([])
         self.ax_virial.grid(True, axis='y', alpha=0.3)
         
         # Equilibrium zone (0.95 to 1.05) highlighted in green
@@ -149,7 +151,7 @@ class LiveSimulationVisualizer:
         
         # Speed control slider (bottom panel, spans both columns)
         self.ax_slider = self.fig.add_subplot(gs[1, :])
-        self.ax_slider.set_title("Simulation Speed Control", fontsize=10)
+        self.ax_slider.set_title("Playback Speed Control", fontsize=10)
         
         # Create slider: 0.0 (1x speed) to 1.0 (unlimited speed)
         self.speed_slider = Slider(
@@ -157,7 +159,7 @@ class LiveSimulationVisualizer:
             label='Speed',
             valmin=0.0,
             valmax=1.0,
-            valinit=0.0,  # Start at 1x speed
+            valinit=0.0,
             valstep=0.05,
             color='skyblue'
         )
@@ -205,12 +207,12 @@ class LiveSimulationVisualizer:
         Update particle trail positions and render with fading alpha.
         
         Args:
-            positions: N x 3 array of current particle positions in cm
+            positions: N x 2 array of current particle positions in AU
         """
         for i in range(self.N):
             # Add current position to this particle's trail
-            x = positions[i, 0] / AU
-            y = positions[i, 1] / AU
+            x = positions[i, 0]
+            y = positions[i, 1]
             self.particle_trails[i].append((x, y))
             
             # Convert deque to line segments for rendering
@@ -220,12 +222,12 @@ class LiveSimulationVisualizer:
                 
                 # Create alpha gradient (older = more transparent)
                 n_segments = len(segments)
-                alphas = np.linspace(0.1, 1.0, n_segments)  # Fade from 0.1 to 1.0
+                alphas = np.linspace(0.1, 1.0, n_segments)
                 
                 # Set colors with alpha gradient
                 colors = np.zeros((n_segments, 4))
-                colors[:, :3] = self.colors[i, :3]  # RGB from particle color
-                colors[:, 3] = alphas  # Alpha channel
+                colors[:, :3] = self.colors[i, :3]
+                colors[:, 3] = alphas
                 
                 # Update line collection
                 self.trail_collections[i].set_segments(segments)
@@ -238,8 +240,6 @@ class LiveSimulationVisualizer:
         Args:
             virial_ratio: current virial ratio value |2*KE/PE|
         """
-        self.current_virial = virial_ratio
-        
         # Clamp to display range
         display_ratio = np.clip(virial_ratio, 0.5, 1.5)
         
@@ -263,50 +263,55 @@ class LiveSimulationVisualizer:
         """
         Animation update function called by FuncAnimation.
         
-        Pulls latest data from queue and updates all visual elements.
+        Advances through pre-computed simulation data.
         
         Args:
-            frame_num: frame number from FuncAnimation (unused)
+            frame_num: frame number from FuncAnimation
         """
-        # Try to get latest frame from queue (non-blocking)
-        try:
-            # Get all available frames, use only the most recent
-            latest_frame = None
-            while True:
-                try:
-                    latest_frame = self.data_queue.get_nowait()
-                except queue.Empty:
-                    break
-            
-            if latest_frame is not None:
-                # Unpack frame data
-                time_yr, positions, velocities, KE, PE = latest_frame
-                
-                self.current_time = time_yr
-                
-                # Update particle trails with fading effect
-                self._update_trails(positions)
-                
-                # Update current particle positions
-                xy_positions = positions[:, :2] / AU  # Convert to AU, use only XY
-                self.particle_scatter.set_offsets(xy_positions)
-                
-                # Calculate and update virial ratio
-                total_KE = np.sum(KE)
-                total_PE = np.sum(PE)
-                if np.abs(total_PE) > 1e-30:
-                    virial_ratio = np.abs(2.0 * total_KE / total_PE)
-                else:
-                    virial_ratio = 1.0
-                self._update_virial_bar(virial_ratio)
-                
-                # Update stats text
-                fps = self._calculate_fps()
-                stats_str = f"Time: {self.current_time:.1f} yr\nFPS: {fps:.1f}"
-                self.stats_text.set_text(stats_str)
-                
-        except Exception as e:
-            print(f"Error updating frame: {e}")
+        # Check if we've reached the end
+        if self.current_frame >= self.n_frames:
+            return [self.particle_scatter, self.virial_indicator, 
+                    self.virial_text, self.stats_text] + self.trail_collections
+        
+        # Get data for current time point
+        current_time = self.time_points[self.current_frame]
+        frame_data = self.data_df[self.data_df['time_yr'] == current_time]
+        
+        # Extract positions and energies
+        positions_cm = frame_data[['x_cm', 'y_cm', 'z_cm']].values
+        positions_au = positions_cm / AU
+        KE = frame_data['KE'].values
+        PE = frame_data['PE'].values
+        
+        # Update particle trails with fading effect
+        self._update_trails(positions_au[:, :2])
+        
+        # Update current particle positions
+        xy_positions = positions_au[:, :2]
+        self.particle_scatter.set_offsets(xy_positions)
+        
+        # Calculate and update virial ratio
+        total_KE = np.sum(KE)
+        total_PE = np.sum(PE)
+        if np.abs(total_PE) > 1e-30:
+            virial_ratio = np.abs(2.0 * total_KE / total_PE)
+        else:
+            virial_ratio = 1.0
+        self._update_virial_bar(virial_ratio)
+        
+        # Update stats text
+        fps = self._calculate_fps()
+        stats_str = f"Time: {current_time:.1f} yr\nFPS: {fps:.1f}\nFrame: {self.current_frame+1}/{self.n_frames}"
+        self.stats_text.set_text(stats_str)
+        
+        # Apply speed control delay
+        if self.speed_multiplier < 0.99:
+            base_delay = 1.0 / self.target_fps
+            delay = base_delay * (1.0 - self.speed_multiplier)
+            time.sleep(delay)
+        
+        # Advance to next frame
+        self.current_frame += 1
         
         return [self.particle_scatter, self.virial_indicator, 
                 self.virial_text, self.stats_text] + self.trail_collections
@@ -319,28 +324,11 @@ class LiveSimulationVisualizer:
         
         # Create animation with target FPS
         self.anim = FuncAnimation(self.fig, self.update_frame,
-                                 interval=1000/TARGET_FPS,  # milliseconds per frame
-                                 blit=True, cache_frame_data=False)
+                                 frames=self.n_frames,
+                                 interval=1000/self.target_fps,
+                                 blit=True, 
+                                 repeat=False,
+                                 cache_frame_data=False)
         
         plt.tight_layout()
         plt.show()
-
-
-def get_speed_delay(speed_multiplier):
-    """
-    Convert speed slider value to frame delay in seconds.
-    
-    Args:
-        speed_multiplier: value from 0.0 (1x) to 1.0 (unlimited)
-        
-    Returns:
-        delay in seconds (0 for unlimited)
-    """
-    if speed_multiplier >= 0.99:
-        return 0.0  # Unlimited speed
-    else:
-        # Map 0.0->1x speed to 0.99->very fast
-        # At 1x (slider=0), delay = 1/30 second (30 FPS)
-        # As slider increases, delay decreases
-        base_delay = 1.0 / TARGET_FPS
-        return base_delay * (1.0 - speed_multiplier)

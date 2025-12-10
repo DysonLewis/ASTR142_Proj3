@@ -2,8 +2,6 @@
 N-body simulation integration module in C++
 Handles the main simulation loop with leapfrog integration
 Calls Python accel module for gravitational acceleration calculations
-
-MODIFIED VERSION: Includes live visualization support via Python callbacks
 */
 
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
@@ -135,7 +133,7 @@ static void handle_collisions(std::vector<double>& X, std::vector<double>& V,
 
 /*
 Check if system has reached virial equilibrium using moving average.
-Virial theorem: 2*KE + PE â‰ˆ 0 at equilibrium
+Virial theorem: 2*KE + PE ≈ 0 at equilibrium
 Returns true if virial ratio is stable near 1.0
 
 Args:
@@ -165,7 +163,7 @@ static bool check_virial_equilibrium(const std::deque<double>& virial_ratios,
 
 /*
 Run a single N-body simulation using leapfrog integration.
-ORIGINAL VERSION: Stores all timesteps and returns complete results array.
+Stores all timesteps and returns complete results array.
 
 Args:
     X0_arr: N x 3 initial positions in cm
@@ -274,9 +272,9 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     
     // Virial equilibrium tracking
     std::deque<double> virial_ratios;
-    const int check_interval = 100;     // how often it checks for stability
-    const int window_size = 500;        // how many step it averages over for stability to be true
-    const double tolerance = 0.02;      // precent deviation
+    const int check_interval = 100;     // how often it checks for stability, this does not affect the chance just runtime
+    const int window_size = 400;        // how many step it averages over for stability to be true
+    const double tolerance = 0.03;      // precent deviation
     const int min_steps = 1000;         // minimum runtime before checking
     bool equilibrium_reached = false;
     int actual_steps = 0;
@@ -426,307 +424,10 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     return (PyObject*)results;
 }
 
-/*
-Run a single N-body simulation with LIVE VISUALIZATION support.
-Invokes Python callback function at regular intervals with current state.
-
-Args:
-    X0_arr: N x 3 initial positions in cm
-    V0_arr: N x 3 initial velocities in cm/s
-    M_arr: N masses in grams
-    perturb_idx_arr: unused (kept for compatibility)
-    perturb_pos_arr: unused (kept for compatibility)
-    perturb_vel_arr: unused (kept for compatibility)
-    sim_id: simulation identifier
-    max_step: maximum number of timesteps
-    dt: timestep in seconds
-    yr: conversion factor from seconds to years
-    collision_radius: minimum distance for collision detection
-    vis_interval: call callback every vis_interval steps
-    callback: Python callable(time_yr, positions, velocities, KE, PE)
-    
-Returns:
-    None (data passed via callback)
-*/
-static PyObject* run_simulation_live([[maybe_unused]] PyObject* self, PyObject* args) {
-    PyArrayObject* X0_arr = nullptr;
-    PyArrayObject* V0_arr = nullptr;
-    PyArrayObject* M_arr = nullptr;
-    PyArrayObject* perturb_idx_arr = nullptr;
-    PyArrayObject* perturb_pos_arr = nullptr;
-    PyArrayObject* perturb_vel_arr = nullptr;
-    PyObject* callback = nullptr;
-    
-    int sim_id, max_step, vis_interval;
-    double dt, yr, collision_radius;
-    
-    if (!PyArg_ParseTuple(args, "O!O!O!O!O!O!iidddiO",
-                          &PyArray_Type, &X0_arr,
-                          &PyArray_Type, &V0_arr,
-                          &PyArray_Type, &M_arr,
-                          &PyArray_Type, &perturb_idx_arr,
-                          &PyArray_Type, &perturb_pos_arr,
-                          &PyArray_Type, &perturb_vel_arr,
-                          &sim_id,
-                          &max_step,
-                          &dt,
-                          &yr,
-                          &collision_radius,
-                          &vis_interval,
-                          &callback)) {
-        return nullptr;
-    }
-    
-    // Verify callback is callable
-    if (!PyCallable_Check(callback)) {
-        PyErr_SetString(PyExc_TypeError, "callback must be callable");
-        return nullptr;
-    }
-    
-    int N = PyArray_DIM(X0_arr, 0);
-    
-    // Copy initial conditions to C++ vectors for fast access
-    std::vector<double> X(N * 3);  // positions flattened [x0,y0,z0,x1,y1,z1,...]
-    std::vector<double> V(N * 3);  // velocities flattened
-    std::vector<double> M(N);      // masses
-    
-    double* X0_data = (double*)PyArray_DATA(X0_arr);
-    double* V0_data = (double*)PyArray_DATA(V0_arr);
-    double* M_data = (double*)PyArray_DATA(M_arr);
-    
-    // Parallelize initial data copying
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < N * 3; i++) {
-        X[i] = X0_data[i];
-        V[i] = V0_data[i];
-    }
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < N; i++) {
-        M[i] = M_data[i];
-    }
-    
-    // Create numpy arrays for passing to accel module and callback
-    npy_intp pos_dims[2] = {N, 3};
-    npy_intp mass_dims[1] = {N};
-    npy_intp energy_dims[1] = {N};
-    
-    PyArrayObject* X_arr = (PyArrayObject*)PyArray_SimpleNew(2, pos_dims, NPY_DOUBLE);
-    PyArrayObject* V_arr = (PyArrayObject*)PyArray_SimpleNew(2, pos_dims, NPY_DOUBLE);
-    PyArrayObject* M_arr_np = (PyArrayObject*)PyArray_SimpleNew(1, mass_dims, NPY_DOUBLE);
-    PyArrayObject* KE_arr = (PyArrayObject*)PyArray_SimpleNew(1, energy_dims, NPY_DOUBLE);
-    PyArrayObject* PE_arr = (PyArrayObject*)PyArray_SimpleNew(1, energy_dims, NPY_DOUBLE);
-    
-    if (!X_arr || !V_arr || !M_arr_np || !KE_arr || !PE_arr) {
-        Py_XDECREF(X_arr);
-        Py_XDECREF(V_arr);
-        Py_XDECREF(M_arr_np);
-        Py_XDECREF(KE_arr);
-        Py_XDECREF(PE_arr);
-        return nullptr;
-    }
-    
-    // Copy masses to numpy array (only need to do once since masses don't change)
-    double* M_arr_data = (double*)PyArray_DATA(M_arr_np);
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < N; i++) {
-        M_arr_data[i] = M[i];
-    }
-    
-    // Get data pointers for arrays we'll update
-    double* X_arr_data = (double*)PyArray_DATA(X_arr);
-    double* V_arr_data = (double*)PyArray_DATA(V_arr);
-    double* KE_arr_data = (double*)PyArray_DATA(KE_arr);
-    double* PE_arr_data = (double*)PyArray_DATA(PE_arr);
-    
-    // Copy initial positions and compute initial acceleration
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < N * 3; i++) {
-        X_arr_data[i] = X[i];
-    }
-    
-    PyArrayObject* A_arr = call_get_accel(X_arr, M_arr_np);
-    if (!A_arr) {
-        Py_DECREF(X_arr);
-        Py_DECREF(V_arr);
-        Py_DECREF(M_arr_np);
-        Py_DECREF(KE_arr);
-        Py_DECREF(PE_arr);
-        return nullptr;
-    }
-    
-    double* A = (double*)PyArray_DATA(A_arr);
-    
-    // Virial equilibrium tracking
-    std::deque<double> virial_ratios;
-    const int check_interval = 100;     // how often it checks for stability
-    const int window_size = 500;        // how many step it averages over for stability to be true
-    const double tolerance = 0.02;      // precent deviation
-    const int min_steps = 1000;         // minimum runtime before checking
-    bool equilibrium_reached = false;
-    
-    // Main leapfrog integration loop
-    for (int step = 0; step < max_step; step++) {
-        double t = step * dt;
-        
-        // Leapfrog step 1: V(t+dt/2) = V(t) + A(t)*dt/2
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < N * 3; i++) {
-            V[i] += A[i] * dt / 2.0;
-        }
-        
-        // Leapfrog step 2: X(t+dt) = X(t) + V(t+dt/2)*dt
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < N * 3; i++) {
-            X[i] += V[i] * dt;
-        }
-        
-        // Handle particle collisions
-        handle_collisions(X, V, M, N, collision_radius);
-        
-        // Update positions in numpy array for accel calculation
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < N * 3; i++) {
-            X_arr_data[i] = X[i];
-        }
-        
-        // Compute A(t+dt) at new positions
-        Py_DECREF(A_arr);
-        A_arr = call_get_accel(X_arr, M_arr_np);
-        if (!A_arr) {
-            Py_DECREF(X_arr);
-            Py_DECREF(V_arr);
-            Py_DECREF(M_arr_np);
-            Py_DECREF(KE_arr);
-            Py_DECREF(PE_arr);
-            return nullptr;
-        }
-        A = (double*)PyArray_DATA(A_arr);
-        
-        // Leapfrog step 3: V(t+dt) = V(t+dt/2) + A(t+dt)*dt/2
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < N * 3; i++) {
-            V[i] += A[i] * dt / 2.0;
-        }
-        
-        // Compute kinetic energy for each particle: KE = 0.5*m*v^2
-        std::vector<double> KE(N);
-        std::vector<double> PE(N, 0.0);
-        
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < N; i++) {
-            double v2 = V[i*3+0]*V[i*3+0] + V[i*3+1]*V[i*3+1] + V[i*3+2]*V[i*3+2];
-            KE[i] = 0.5 * M[i] * v2;
-        }
-        
-        // Compute potential energy for each particle
-        // PE_ij = -G*m_i*m_j / r_ij
-        // Each particle gets half of each pair interaction to avoid double counting when summing
-        #pragma omp parallel for schedule(dynamic)
-        for (int i = 0; i < N; i++) {
-            for (int j = i+1; j < N; j++) {
-                double dx = X[i*3+0] - X[j*3+0];
-                double dy = X[i*3+1] - X[j*3+1];
-                double dz = X[i*3+2] - X[j*3+2];
-                double r = std::sqrt(dx*dx + dy*dy + dz*dz);
-                double pe_term = -G * M[i] * M[j] / r;
-                #pragma omp atomic
-                PE[i] += pe_term * 0.5;
-                #pragma omp atomic
-                PE[j] += pe_term * 0.5;
-            }
-        }
-        
-        // Invoke callback at visualization interval
-        if (step % vis_interval == 0) {
-            // Update velocity and energy arrays
-            #pragma omp parallel for schedule(static)
-            for (int i = 0; i < N * 3; i++) {
-                V_arr_data[i] = V[i];
-            }
-            
-            #pragma omp parallel for schedule(static)
-            for (int i = 0; i < N; i++) {
-                KE_arr_data[i] = KE[i];
-                PE_arr_data[i] = PE[i];
-            }
-            
-            // Call Python callback: callback(time_yr, positions, velocities, KE, PE)
-            PyObject* callback_args = Py_BuildValue("(dOOOO)",
-                                                    t / yr,
-                                                    X_arr,
-                                                    V_arr,
-                                                    KE_arr,
-                                                    PE_arr);
-            
-            if (callback_args) {
-                PyObject* callback_result = PyObject_CallObject(callback, callback_args);
-                Py_DECREF(callback_args);
-                
-                if (callback_result) {
-                    Py_DECREF(callback_result);
-                } else {
-                    // Callback raised an exception
-                    PyErr_Print();
-                    Py_DECREF(X_arr);
-                    Py_DECREF(V_arr);
-                    Py_DECREF(M_arr_np);
-                    Py_DECREF(KE_arr);
-                    Py_DECREF(PE_arr);
-                    Py_DECREF(A_arr);
-                    return nullptr;
-                }
-            }
-        }
-        
-        // Check virial equilibrium every check_interval steps
-        if (step % check_interval == 0 && step >= min_steps) {
-            double total_KE = 0.0;
-            double total_PE = 0.0;
-            
-            for (int i = 0; i < N; i++) {
-                total_KE += KE[i];
-                total_PE += PE[i];
-            }
-            
-            if (std::abs(total_PE) > 1e-30) {
-                double virial_ratio = std::abs(2.0 * total_KE / total_PE);
-                virial_ratios.push_back(virial_ratio);
-                
-                if (virial_ratios.size() > (size_t)(window_size * 2)) {
-                    virial_ratios.pop_front();
-                }
-                
-                if (check_virial_equilibrium(virial_ratios, window_size, tolerance)) {
-                    equilibrium_reached = true;
-                    break;
-                }
-            }
-        }
-    }
-    
-    // Clean up numpy arrays
-    Py_DECREF(X_arr);
-    Py_DECREF(V_arr);
-    Py_DECREF(M_arr_np);
-    Py_DECREF(KE_arr);
-    Py_DECREF(PE_arr);
-    Py_DECREF(A_arr);
-    
-    if (equilibrium_reached) {
-        printf("Virial equilibrium reached!\n");
-    } else {
-        printf("Maximum steps reached without achieving virial equilibrium\n");
-    }
-    
-    Py_RETURN_NONE;
-}
-
 // Python module method definitions
 static PyMethodDef simulator_methods[] = {
     {"run_simulation", run_simulation, METH_VARARGS, 
      "Run a single N-body simulation"},
-    {"run_simulation_live", run_simulation_live, METH_VARARGS,
-     "Run N-body simulation with live visualization callbacks"},
     {nullptr, nullptr, 0, nullptr}
 };
 

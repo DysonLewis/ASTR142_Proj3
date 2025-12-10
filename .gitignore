@@ -1,3 +1,4 @@
 *.so
 *.csv
 *.fits
+__pycache__/
