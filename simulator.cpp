@@ -2,7 +2,7 @@
 N-body simulation integration module in C++
 Handles the main simulation loop with leapfrog integration
 Calls Python accel module for gravitational acceleration calculations
-STREAMING VERSION - returns data in chunks to avoid memory overflow
+Streaming, returns data in chunks to avoid memory overflow
 */
 
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
@@ -271,8 +271,8 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     // Virial equilibrium tracking
     std::deque<double> virial_ratios;
     const int check_interval = 100;     // how often it checks for stability, this does not affect the chance just runtime
-    const int window_size = 400;        // how many step it averages over for stability to be true
-    const double tolerance = 0.03;      // precent deviation
+    const int window_size = 500;        // how many step it averages over for stability to be true
+    const double tolerance = 0.02;      // precent deviation
     const int min_steps = 1000;         // minimum runtime before checking
     bool equilibrium_reached = false;
     
