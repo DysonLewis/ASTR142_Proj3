@@ -22,7 +22,6 @@ os.makedirs(plot_dir, exist_ok=True)
 num_threads = accel.get_num_threads()
 print(f"OpenMP threads available: {num_threads}")
 
-
 # Visualization parameters
 TRAIL_LENGTH = 50  # Number of historical positions to keep per particle
 TARGET_FPS = 30    # Target frames per second for animation
@@ -31,13 +30,13 @@ WINDOW_HEIGHT = 800  # Total window height in pixels
 PLOT_STEPS = 100   # Subsample static plots to every Nth step to reduce data density
 
 # Hardcoded parameters, these seem to give a good chance of virial equilibrium 
-N = int(50)
+N = int(10)
 sphere_radius = float(0.001) * AU
 total_mass = float(1e-16) * Msol
-max_years = float(3000)
-n_simulations = int(3)
+max_years = float(10000)
+n_simulations = int(1)
 collision_radius_factor = 0.01
-chunk_steps = 10000  # Write results to FITS every N steps to avoid memory overflow
+chunk_steps = 5000  # Write results to FITS every N steps to avoid memory overflow
 
 # # Get simulation parameters from user
 # N = int(input("Enter number of particles: "))
@@ -372,8 +371,9 @@ def main():
     print("=" * 60)
     
     visualizer = SimulationVisualizer(
-        df_sim1, 
-        sphere_radius,
+        fits_filename,
+        sim_id=1,
+        sphere_radius=sphere_radius,
         trail_length=TRAIL_LENGTH,
         target_fps=TARGET_FPS,
         window_width=WINDOW_WIDTH,

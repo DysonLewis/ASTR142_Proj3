@@ -5,6 +5,9 @@ from matplotlib.widgets import Slider
 from matplotlib.collections import LineCollection
 from collections import deque
 import time
+from astropy.io import fits
+from astropy.table import Table
+import pandas as pd
 
 # Physical constants in CGS units
 AU = 1.496e13      # astronomical unit in cm
@@ -16,34 +19,82 @@ class SimulationVisualizer:
     
     Displays particles in XY plane with trailing motion blur effect and
     a virial ratio indicator bar showing system energy balance.
+    
+    Reads directly from FITS file in streaming fashion to minimize memory usage.
     """
     
-    def __init__(self, data_df, sphere_radius, visualization_interval=1, trail_length=50, 
-                 target_fps=30, window_width=1400, window_height=800):
+    def __init__(self, fits_filename, sim_id, sphere_radius, visualization_interval=1, 
+                 trail_length=50, target_fps=30, window_width=1400, window_height=800, 
+                 chunk_cache_size=5):
         """
         Initialize the visualization window and data structures.
         
         Args:
-            data_df: pandas DataFrame with simulation data
+            fits_filename: path to FITS file containing simulation data
+            sim_id: which simulation to visualize
             sphere_radius: initial sphere radius in cm
             visualization_interval: UNUSED - kept for compatibility
             trail_length: number of historical positions to keep per particle
             target_fps: target frames per second for animation
             window_width: total window width in pixels
             window_height: total window height in pixels
+            chunk_cache_size: number of chunks to keep in memory at once
         """
-        self.data_df = data_df
+        self.fits_filename = fits_filename
+        self.sim_id = sim_id
         self.sphere_radius = sphere_radius
-        self.N = len(data_df['body_idx'].unique())
         self.trail_length = trail_length
         self.target_fps = target_fps
         self.window_width = window_width
         self.window_height = window_height
+        self.chunk_cache_size = chunk_cache_size
         
-        # Get ALL unique time points (no subsampling - we'll dynamically choose based on speed)
-        self.all_time_points = sorted(data_df['time_yr'].unique())
-        self.n_total_frames = len(self.all_time_points)
+        # Read FITS file to get metadata
+        print("Loading simulation metadata from FITS...")
+        with fits.open(fits_filename) as hdul:
+            # Get number of bodies from header
+            self.N = hdul[0].header['N_BODIES']
+            
+            # Find all chunks for this simulation and get time points
+            self.chunk_indices = []
+            self.chunk_time_ranges = []  # Store (start_time, end_time) for each chunk
+            all_times = []
+            
+            for i in range(1, len(hdul)):
+                if 'SIMID' in hdul[i].header and hdul[i].header['SIMID'] == sim_id:
+                    chunk_data = Table(hdul[i].data).to_pandas()
+                    times = sorted(chunk_data['time_yr'].unique())
+                    
+                    self.chunk_indices.append(i)
+                    self.chunk_time_ranges.append((times[0], times[-1]))
+                    all_times.extend(times)
+            
+            self.all_time_points = sorted(list(set(all_times)))  # Remove duplicates and sort
+            self.n_total_frames = len(self.all_time_points)
+            
+        print(f"Found {len(self.chunk_indices)} chunks with {self.n_total_frames} time points")
+        
+        # Build index: time_val -> chunk_hdu_idx for fast lookup
+        self.time_to_chunk = {}
+        for chunk_idx, (start_time, end_time) in zip(self.chunk_indices, self.chunk_time_ranges):
+            for time_val in self.all_time_points:
+                if start_time <= time_val <= end_time:
+                    self.time_to_chunk[time_val] = chunk_idx
+            
+        print(f"Found {len(self.chunk_indices)} chunks with {self.n_total_frames} time points")
+        
         self.current_time_index = 0
+        
+        # Chunk cache: {chunk_hdu_index: dataframe}
+        self.chunk_cache = {}
+        self.chunk_lru = deque(maxlen=chunk_cache_size)
+        
+        # Preload first few chunks
+        print("Preloading initial chunks...")
+        chunks_to_preload = min(chunk_cache_size, len(self.chunk_indices))
+        for i in range(chunks_to_preload):
+            self._load_chunk(self.chunk_indices[i])
+        print(f"Preloaded {chunks_to_preload} chunks")
         
         # Trail data: each particle has deque of (x, y) positions
         self.particle_trails = [deque(maxlen=trail_length) for _ in range(self.N)]
@@ -67,6 +118,63 @@ class SimulationVisualizer:
         self.plot_limit = 2.0 * sphere_radius / AU
         
         self._setup_figure()
+    
+    def _load_chunk(self, chunk_hdu_idx):
+        """
+        Load a chunk from FITS file into cache.
+        
+        Args:
+            chunk_hdu_idx: HDU index in FITS file
+        """
+        # Check if already cached
+        if chunk_hdu_idx in self.chunk_cache:
+            return
+        
+        # If cache is full, remove oldest
+        if len(self.chunk_cache) >= self.chunk_cache_size:
+            if len(self.chunk_lru) > 0:
+                old_chunk = self.chunk_lru.popleft()
+                if old_chunk in self.chunk_cache:
+                    del self.chunk_cache[old_chunk]
+        
+        # Load chunk from FITS
+        with fits.open(self.fits_filename) as hdul:
+            chunk_data = Table(hdul[chunk_hdu_idx].data).to_pandas()
+            self.chunk_cache[chunk_hdu_idx] = chunk_data
+            self.chunk_lru.append(chunk_hdu_idx)
+    
+    def _get_frame_data(self, time_val):
+        """
+        Get data for a specific time value, loading chunks as needed.
+        Uses prebuilt index for O(1) lookup.
+        
+        Args:
+            time_val: time in years
+            
+        Returns:
+            DataFrame for that time point
+        """
+        # Fast lookup using index
+        chunk_hdu_idx = self.time_to_chunk.get(time_val)
+        if chunk_hdu_idx is None:
+            return None
+        
+        # Load chunk if not in cache
+        if chunk_hdu_idx not in self.chunk_cache:
+            self._load_chunk(chunk_hdu_idx)
+            
+            # Predictive preloading: load next chunk too if not already loaded
+            try:
+                next_chunk_idx = self.chunk_indices[self.chunk_indices.index(chunk_hdu_idx) + 1]
+                if next_chunk_idx not in self.chunk_cache:
+                    self._load_chunk(next_chunk_idx)
+            except (ValueError, IndexError):
+                pass  # No next chunk or already at end
+        
+        chunk_df = self.chunk_cache[chunk_hdu_idx]
+        
+        # Return rows for this time (use numpy for speed)
+        return chunk_df[chunk_df['time_yr'] == time_val]
         
     def _setup_figure(self):
         """
@@ -159,7 +267,7 @@ class SimulationVisualizer:
         # Slider value is log10(years_per_second), so 0.0 = 1 yr/s, 3.0 = 1000 yr/s
         self.speed_slider = Slider(
             ax=self.ax_slider,
-            label='Speed',
+            label='log(speed)',
             valmin=0.0,
             valmax=3.0,
             valinit=0.0,
@@ -298,9 +406,13 @@ class SimulationVisualizer:
         # Clamp to valid range
         self.current_time_index = min(self.current_time_index, self.n_total_frames - 1)
         
-        # Get data for current time point
+        # Get data for current time point (streaming from FITS)
         current_time = self.all_time_points[self.current_time_index]
-        frame_data = self.data_df[self.data_df['time_yr'] == current_time]
+        frame_data = self._get_frame_data(current_time)
+        
+        if frame_data is None or len(frame_data) == 0:
+            return [self.particle_scatter, self.virial_indicator, 
+                    self.virial_text, self.stats_text] + self.trail_collections
         
         # Extract positions and energies
         positions_cm = frame_data[['x_cm', 'y_cm', 'z_cm']].values
