@@ -28,15 +28,16 @@ TRAIL_LENGTH = 50  # Number of historical positions to keep per particle
 TARGET_FPS = 30    # Target frames per second for animation
 WINDOW_WIDTH = 1400  # Total window width in pixels
 WINDOW_HEIGHT = 800  # Total window height in pixels
-PLOT_STEPS = 1000   # Subsample static plots to every Nth step to reduce data density
+PLOT_STEPS = 100   # Subsample static plots to every Nth step to reduce data density
 
 # Hardcoded parameters, these seem to give a good chance of virial equilibrium 
-N = int(4)
+N = int(50)
 sphere_radius = float(0.001) * AU
 total_mass = float(1e-16) * Msol
-max_years = float(50000)
-n_simulations = int(1)
+max_years = float(3000)
+n_simulations = int(3)
 collision_radius_factor = 0.01
+chunk_steps = 10000  # Write results to FITS every N steps to avoid memory overflow
 
 # # Get simulation parameters from user
 # N = int(input("Enter number of particles: "))
@@ -97,7 +98,7 @@ def generate_sphere_particles(N, radius):
 
 def run_and_save_simulation(sim_id, fits_filename, append=False):
     """
-    Run a single simulation and save to FITS file.
+    Run a single simulation and save to FITS file incrementally.
     
     Args:
         sim_id: simulation identifier (1-indexed)
@@ -105,8 +106,10 @@ def run_and_save_simulation(sim_id, fits_filename, append=False):
         append: if True, append to existing file; if False, create new file
         
     Returns:
-        DataFrame with simulation results
+        DataFrame with simulation results (only first chunk for visualization)
     """
+    import gc
+    
     print(f"\nSimulation {sim_id}/{n_simulations}")
     
     # Generate initial conditions
@@ -118,43 +121,25 @@ def run_and_save_simulation(sim_id, fits_filename, append=False):
     perturb_pos = np.zeros((0, 3))
     perturb_vel = np.zeros((0, 3))
     
-    # Run simulation
-    results = run_simulation(
+    # Run simulation - returns list of chunk arrays
+    print(f"Running simulation in chunks of {chunk_steps} steps...")
+    result_chunks = run_simulation(
         X0, V0, M,
         perturb_indices,
         perturb_pos,
         perturb_vel,
         sim_id,
         max_step,
+        chunk_steps,
         dt,
         yr,
         collision_radius
     )
     
-    # Convert to DataFrame
-    df_sim = pd.DataFrame(results, columns=[
-        "simulation", "time_yr", "body_idx",
-        "x_cm", "y_cm", "z_cm",
-        "vx_cm_s", "vy_cm_s", "vz_cm_s",
-        "KE", "PE"
-    ])
+    print(f"Received {len(result_chunks)} chunks, writing to FITS...")
     
-    df_sim["E_tot"] = df_sim["KE"] + df_sim["PE"]
-    
-    # Convert to astropy Table for FITS
-    table = Table.from_pandas(df_sim)
-    
-    if append:
-        # Append to existing FITS file
-        table_hdu = fits.BinTableHDU(table)
-        table_hdu.header['SIMID'] = (sim_id, 'Simulation ID number')
-        table_hdu.header['EXTNAME'] = f'SIM_{sim_id}'
-        
-        with fits.open(fits_filename, mode='append') as hdul:
-            hdul.append(table_hdu)
-            hdul.flush()
-    else:
-        # Create new FITS file with primary HDU
+    # Create FITS file with header on first chunk
+    if not append:
         primary_hdu = fits.PrimaryHDU()
         primary_hdu.header['N_BODIES'] = N
         primary_hdu.header['SPHRAD'] = (sphere_radius, 'Initial sphere radius [cm]')
@@ -164,17 +149,54 @@ def run_and_save_simulation(sim_id, fits_filename, append=False):
         primary_hdu.header['COLLRAD'] = (collision_radius, 'Collision radius [cm]')
         primary_hdu.header['NSIMS'] = n_simulations
         
-        # Create table HDU for first simulation
+        hdul = fits.HDUList([primary_hdu])
+        hdul.writeto(fits_filename, overwrite=True)
+        del hdul
+        gc.collect()
+    
+    # Keep first chunk for visualization
+    first_chunk_df = None
+    
+    # Process and write chunks one at a time
+    for chunk_idx, chunk_array in enumerate(result_chunks):
+        # Convert chunk to DataFrame
+        df_chunk = pd.DataFrame(chunk_array, columns=[
+            "simulation", "time_yr", "body_idx",
+            "x_cm", "y_cm", "z_cm",
+            "vx_cm_s", "vy_cm_s", "vz_cm_s",
+            "KE", "PE"
+        ])
+        
+        df_chunk["E_tot"] = df_chunk["KE"] + df_chunk["PE"]
+        
+        # Keep first chunk for return value
+        if chunk_idx == 0:
+            first_chunk_df = df_chunk.copy()
+        
+        # Convert to astropy Table and append to FITS
+        table = Table.from_pandas(df_chunk)
         table_hdu = fits.BinTableHDU(table)
         table_hdu.header['SIMID'] = (sim_id, 'Simulation ID number')
-        table_hdu.header['EXTNAME'] = f'SIM_{sim_id}'
+        table_hdu.header['CHUNK'] = (chunk_idx, 'Chunk number')
+        table_hdu.header['EXTNAME'] = f'SIM_{sim_id}_CHUNK_{chunk_idx}'
         
-        hdul = fits.HDUList([primary_hdu, table_hdu])
-        hdul.writeto(fits_filename, overwrite=True)
+        with fits.open(fits_filename, mode='append') as hdul:
+            hdul.append(table_hdu)
+            hdul.flush()
+        
+        # Clean up this chunk
+        del df_chunk
+        del table
+        del table_hdu
+        gc.collect()
+        
+        if (chunk_idx + 1) % 10 == 0:
+            print(f"  Written {chunk_idx + 1}/{len(result_chunks)} chunks...")
     
     print(f"Simulation {sim_id} complete and saved to FITS")
     
-    return df_sim
+    # Return first chunk for visualization
+    return first_chunk_df
 
 
 def background_simulations(fits_filename, start_sim, end_sim):
@@ -368,15 +390,18 @@ def main():
     
     # Read all data from FITS file for final plots
     print("\n" + "=" * 60)
-    print("Reading all simulation data from FITS file...")
+    print("Reading simulation data from FITS file for plotting...")
     print("=" * 60)
     
+    # Read and concatenate all chunks for simulation 1 only
     all_dfs = []
     with fits.open(fits_filename) as hdul:
         for i in range(1, len(hdul)):
-            table = hdul[i].data
-            df = Table(table).to_pandas()
-            all_dfs.append(df)
+            # Only read simulation 1 chunks for plotting
+            if 'SIMID' in hdul[i].header and hdul[i].header['SIMID'] == 1:
+                table = hdul[i].data
+                df = Table(table).to_pandas()
+                all_dfs.append(df)
     
     df_all = pd.concat(all_dfs, ignore_index=True)
     

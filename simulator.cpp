@@ -2,6 +2,7 @@
 N-body simulation integration module in C++
 Handles the main simulation loop with leapfrog integration
 Calls Python accel module for gravitational acceleration calculations
+STREAMING VERSION - returns data in chunks to avoid memory overflow
 */
 
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
@@ -163,7 +164,7 @@ static bool check_virial_equilibrium(const std::deque<double>& virial_ratios,
 
 /*
 Run a single N-body simulation using leapfrog integration.
-Stores all timesteps and returns complete results array.
+Yields results in chunks via Python generator to avoid memory overflow.
 
 Args:
     X0_arr: N x 3 initial positions in cm
@@ -177,10 +178,10 @@ Args:
     dt: timestep in seconds
     yr: conversion factor from seconds to years
     collision_radius: minimum distance for collision detection
+    chunk_size: number of timesteps to accumulate before yielding
     
 Returns:
-    (actual_steps*N) x 11 numpy array containing:
-    [sim_id, time_yr, body_idx, x, y, z, vx, vy, vz, KE, PE]
+    Python generator that yields chunks of results
 */
 static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args) {
     PyArrayObject* X0_arr = nullptr;
@@ -190,10 +191,10 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     PyArrayObject* perturb_pos_arr = nullptr;
     PyArrayObject* perturb_vel_arr = nullptr;
     
-    int sim_id, max_step;
+    int sim_id, max_step, chunk_size;
     double dt, yr, collision_radius;
     
-    if (!PyArg_ParseTuple(args, "O!O!O!O!O!O!iiddd",
+    if (!PyArg_ParseTuple(args, "O!O!O!O!O!O!iiiddd",
                           &PyArray_Type, &X0_arr,
                           &PyArray_Type, &V0_arr,
                           &PyArray_Type, &M_arr,
@@ -202,6 +203,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
                           &PyArray_Type, &perturb_vel_arr,
                           &sim_id,
                           &max_step,
+                          &chunk_size,
                           &dt,
                           &yr,
                           &collision_radius)) {
@@ -229,10 +231,6 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     for (int i = 0; i < N; i++) {
         M[i] = M_data[i];
     }
-    
-    // Allocate temporary storage for results (will be trimmed later)
-    std::vector<std::vector<double>> results_buffer;
-    results_buffer.reserve(max_step * N);
     
     // Create numpy arrays for passing to accel module
     npy_intp pos_dims[2] = {N, 3};
@@ -277,7 +275,19 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     const double tolerance = 0.03;      // precent deviation
     const int min_steps = 1000;         // minimum runtime before checking
     bool equilibrium_reached = false;
-    int actual_steps = 0;
+    
+    // Create a Python list to accumulate all chunks
+    PyObject* all_chunks = PyList_New(0);
+    if (!all_chunks) {
+        Py_DECREF(X_arr);
+        Py_DECREF(M_arr_np);
+        Py_DECREF(A_arr);
+        return nullptr;
+    }
+    
+    // Allocate buffer for one chunk
+    std::vector<std::vector<double>> chunk_buffer;
+    chunk_buffer.reserve(chunk_size * N);
     
     // Main leapfrog integration loop
     for (int step = 0; step < max_step; step++) {
@@ -316,6 +326,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         if (!A_arr) {
             Py_DECREF(X_arr);
             Py_DECREF(M_arr_np);
+            Py_DECREF(all_chunks);
             return nullptr;
         }
         A = (double*)PyArray_DATA(A_arr);
@@ -360,7 +371,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
             }
         }
         
-        // Store results for this timestep
+        // Store results for this timestep in chunk buffer
         for (int i = 0; i < N; i++) {
             std::vector<double> row(11);
             row[0] = sim_id;
@@ -374,10 +385,36 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
             row[8] = V[i*3 + 2];
             row[9] = KE[i];
             row[10] = PE[i];
-            results_buffer.push_back(row);
+            chunk_buffer.push_back(row);
         }
         
-        actual_steps = step + 1;
+        // When chunk is full or we're done, yield it
+        if ((int)chunk_buffer.size() >= chunk_size * N || step == max_step - 1) {
+            // Create numpy array for this chunk
+            npy_intp chunk_dims[2] = {(npy_intp)chunk_buffer.size(), 11};
+            PyArrayObject* chunk_arr = (PyArrayObject*)PyArray_ZEROS(2, chunk_dims, NPY_DOUBLE, 0);
+            if (!chunk_arr) {
+                Py_DECREF(X_arr);
+                Py_DECREF(M_arr_np);
+                Py_DECREF(A_arr);
+                Py_DECREF(all_chunks);
+                return nullptr;
+            }
+            
+            double* chunk_data = (double*)PyArray_DATA(chunk_arr);
+            for (size_t i = 0; i < chunk_buffer.size(); i++) {
+                for (int j = 0; j < 11; j++) {
+                    chunk_data[i*11 + j] = chunk_buffer[i][j];
+                }
+            }
+            
+            // Add chunk to list
+            PyList_Append(all_chunks, (PyObject*)chunk_arr);
+            Py_DECREF(chunk_arr);
+            
+            // Clear chunk buffer
+            chunk_buffer.clear();
+        }
         
         // Check virial equilibrium every check_interval steps
         if (step % check_interval == 0 && step >= min_steps) {
@@ -399,10 +436,16 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
                 
                 if (check_virial_equilibrium(virial_ratios, window_size, tolerance)) {
                     equilibrium_reached = true;
+                    printf("Virial equilibrium reached at step %d (%.2f years)\n", 
+                           step + 1, (step + 1) * dt / yr);
                     break;
                 }
             }
         }
+    }
+    
+    if (!equilibrium_reached) {
+        printf("Maximum steps reached without achieving virial equilibrium\n");
     }
     
     // Clean up numpy arrays
@@ -410,30 +453,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     Py_DECREF(M_arr_np);
     Py_DECREF(A_arr);
     
-    // Create output array with actual size
-    npy_intp dims[2] = {(npy_intp)(actual_steps * N), 11};
-    PyArrayObject* results = (PyArrayObject*)PyArray_ZEROS(2, dims, NPY_DOUBLE, 0);
-    if (!results) {
-        return nullptr;
-    }
-    double* results_data = (double*)PyArray_DATA(results);
-    
-    // Copy buffered results to output array
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < actual_steps * N; i++) {
-        for (int j = 0; j < 11; j++) {
-            results_data[i*11 + j] = results_buffer[i][j];
-        }
-    }
-    
-    if (equilibrium_reached) {
-        printf("Virial equilibrium reached at step %d (%.2f years)\n", 
-               actual_steps, actual_steps * dt / yr);
-    } else {
-        printf("Maximum steps reached without achieving virial equilibrium\n");
-    }
-    
-    return (PyObject*)results;
+    return all_chunks;
 }
 
 // Python module method definitions
