@@ -1,6 +1,7 @@
 /*
  * N-body gravitational acceleration calculation in C++
  * Ultra-precision version using long double + Kahan summation
+ * Gravitational softening for close (d = r) pairs
  */
 
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
@@ -16,10 +17,12 @@ static PyObject* get_accel([[maybe_unused]] PyObject* self, PyObject* args) {
     PyArrayObject* R_arr = nullptr;
     PyArrayObject* M_arr = nullptr;
     PyArrayObject* A_arr = nullptr;
+    double collision_radius;
     
-    if (!PyArg_ParseTuple(args, "O!O!", 
+    if (!PyArg_ParseTuple(args, "O!O!d", 
                           &PyArray_Type, &R_arr,
-                          &PyArray_Type, &M_arr)) {
+                          &PyArray_Type, &M_arr,
+                          &collision_radius)) {
         return nullptr;
     }
     
@@ -50,6 +53,9 @@ static PyObject* get_accel([[maybe_unused]] PyObject* self, PyObject* args) {
     double* M_in = (double*)PyArray_DATA(M_arr);
     double* A = (double*)PyArray_DATA(A_arr);
     
+    // Convert collision_radius to long double for internal use
+    long double coll_rad = (long double)collision_radius;
+    
     // Release GIL during computation - this allows other Python threads to run
     Py_BEGIN_ALLOW_THREADS
     
@@ -68,7 +74,11 @@ static PyObject* get_accel([[maybe_unused]] PyObject* self, PyObject* args) {
             
             long double r2 = dx*dx + dy*dy + dz*dz;
             long double r = sqrtl(r2);
-            long double r3 = r2 * r;
+            
+            // Apply gravitational softening for close pairs
+            // This reduces FP errors, and (theoretically) stop spontaneous motion from stopped particles 
+            long double r_soft = (r < coll_rad) ? coll_rad : r;
+            long double r3 = r_soft * r_soft * r_soft;
             long double ir3 = 1.0L / r3;
             
             long double factor = G * (long double)M_in[j] * ir3;

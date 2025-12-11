@@ -2,7 +2,7 @@
 N-body simulation integration module in C++
 Handles the main simulation loop with leapfrog integration
 Calls Python accel module for gravitational acceleration calculations
-STREAMING VERSION - returns data in chunks to avoid memory overflow
+Streaming, returns data in chunks to avoid memory overflow
 */
 
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
@@ -31,11 +31,12 @@ Call the Python accel module's get_accel function to compute accelerations.
 Args:
     X_arr: N x 3 numpy array of positions in cm
     M_arr: N length numpy array of masses in grams
+    collision_radius: minimum distance for gravitational softening
     
 Returns:
     N x 3 numpy array of accelerations in cm/s^2
 */
-static PyArrayObject* call_get_accel(PyArrayObject* X_arr, PyArrayObject* M_arr) {
+static PyArrayObject* call_get_accel(PyArrayObject* X_arr, PyArrayObject* M_arr, double collision_radius) {
     PyObject* accel_module = PyImport_ImportModule("accel");
     if (!accel_module) {
         PyErr_SetString(PyExc_ImportError, "Failed to import accel module");
@@ -50,7 +51,7 @@ static PyArrayObject* call_get_accel(PyArrayObject* X_arr, PyArrayObject* M_arr)
         return nullptr;
     }
     
-    PyObject* args = PyTuple_Pack(2, X_arr, M_arr);
+    PyObject* args = PyTuple_Pack(3, X_arr, M_arr, PyFloat_FromDouble(collision_radius));
     PyObject* result = PyObject_CallObject(get_accel_func, args);
     
     Py_DECREF(args);
@@ -76,56 +77,65 @@ Args:
 */
 static void handle_collisions(std::vector<double>& X, std::vector<double>& V, 
                              const std::vector<double>& M, int N, double collision_radius) {
+    // Convert collision_radius to long double for precision
+    long double coll_rad = (long double)collision_radius;
+    
     for (int i = 0; i < N; i++) {
         for (int j = i+1; j < N; j++) {
-            double dx = X[i*3+0] - X[j*3+0];
-            double dy = X[i*3+1] - X[j*3+1];
-            double dz = X[i*3+2] - X[j*3+2];
-            double r = std::sqrt(dx*dx + dy*dy + dz*dz);
+            long double dx = (long double)X[i*3+0] - (long double)X[j*3+0];
+            long double dy = (long double)X[i*3+1] - (long double)X[j*3+1];
+            long double dz = (long double)X[i*3+2] - (long double)X[j*3+2];
+            long double r = sqrtl(dx*dx + dy*dy + dz*dz);
             
-            if (r < collision_radius) {
+            if (r < coll_rad) {
                 // Collision normal vector
-                double nx = dx / r;
-                double ny = dy / r;
-                double nz = dz / r;
+                long double nx = dx / r;
+                long double ny = dy / r;
+                long double nz = dz / r;
                 
                 // Relative velocity
-                double v_rel_x = V[i*3+0] - V[j*3+0];
-                double v_rel_y = V[i*3+1] - V[j*3+1];
-                double v_rel_z = V[i*3+2] - V[j*3+2];
+                long double v_rel_x = (long double)V[i*3+0] - (long double)V[j*3+0];
+                long double v_rel_y = (long double)V[i*3+1] - (long double)V[j*3+1];
+                long double v_rel_z = (long double)V[i*3+2] - (long double)V[j*3+2];
                 
                 // Relative velocity along normal
-                double v_rel_n = v_rel_x*nx + v_rel_y*ny + v_rel_z*nz;
+                long double v_rel_n = v_rel_x*nx + v_rel_y*ny + v_rel_z*nz;
                 
                 // Only apply collision if particles are approaching
-                if (v_rel_n < 0) {
-                    double m_i = M[i];
-                    double m_j = M[j];
-                    double m_total = m_i + m_j;
+                if (v_rel_n < 0.0L) {
+                    long double m_i = (long double)M[i];
+                    long double m_j = (long double)M[j];
+                    long double m_total = m_i + m_j;
                     
                     // Elastic collision impulse
-                    double impulse = 2.0 * m_i * m_j * v_rel_n / m_total;
+                    long double impulse = 2.0L * m_i * m_j * v_rel_n / m_total;
                     
                     // Apply impulse to velocities
-                    V[i*3+0] -= (impulse / m_i) * nx;
-                    V[i*3+1] -= (impulse / m_i) * ny;
-                    V[i*3+2] -= (impulse / m_i) * nz;
+                    V[i*3+0] -= (double)((impulse / m_i) * nx);
+                    V[i*3+1] -= (double)((impulse / m_i) * ny);
+                    V[i*3+2] -= (double)((impulse / m_i) * nz);
                     
-                    V[j*3+0] += (impulse / m_j) * nx;
-                    V[j*3+1] += (impulse / m_j) * ny;
-                    V[j*3+2] += (impulse / m_j) * nz;
+                    V[j*3+0] += (double)((impulse / m_j) * nx);
+                    V[j*3+1] += (double)((impulse / m_j) * ny);
+                    V[j*3+2] += (double)((impulse / m_j) * nz);
                     
+                    /* This is not needed anymore with gravitational damping
+                    Actually seemed to be less accurate
+                    Two articles overlapping at rest would generate energy from nothing
+                    This of course is wildly physically inaccurate
+
                     // Separate overlapping particles
-                    double overlap = collision_radius - r;
-                    double separation = overlap / 2.0 + 1e-10;
+                    long double overlap = coll_rad - r;
+                    long double separation = overlap / 2.0L + 1e-10L;
                     
-                    X[i*3+0] += separation * nx;
-                    X[i*3+1] += separation * ny;
-                    X[i*3+2] += separation * nz;
+                    X[i*3+0] += (double)(separation * nx);
+                    X[i*3+1] += (double)(separation * ny);
+                    X[i*3+2] += (double)(separation * nz);
                     
-                    X[j*3+0] -= separation * nx;
-                    X[j*3+1] -= separation * ny;
-                    X[j*3+2] -= separation * nz;
+                    X[j*3+0] -= (double)(separation * nx);
+                    X[j*3+1] -= (double)(separation * ny);
+                    X[j*3+2] -= (double)(separation * nz);
+                    */
                 }
             }
         }
@@ -275,7 +285,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         X_arr_data[i] = X[i];
     }
     
-    PyArrayObject* A_arr = call_get_accel(X_arr, M_arr_np);
+    PyArrayObject* A_arr = call_get_accel(X_arr, M_arr_np, collision_radius);
     if (!A_arr) {
         Py_DECREF(X_arr);
         Py_DECREF(M_arr_np);
@@ -360,7 +370,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         
         // Compute A(t+dt) at new positions
         Py_DECREF(A_arr);
-        A_arr = call_get_accel(X_arr, M_arr_np);
+        A_arr = call_get_accel(X_arr, M_arr_np, collision_radius);
         if (!A_arr) {
             Py_DECREF(X_arr);
             Py_DECREF(M_arr_np);
