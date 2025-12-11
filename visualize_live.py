@@ -8,6 +8,14 @@ import time
 from astropy.io import fits
 from astropy.table import Table
 import pandas as pd
+import warnings
+import os
+
+# Suppress matplotlib tight_layout warning
+warnings.filterwarnings('ignore', message='This figure includes Axes that are not compatible with tight_layout')
+
+# Suppress Qt warnings
+os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false'
 
 # Physical constants in CGS units
 AU = 1.496e13      # astronomical unit in cm

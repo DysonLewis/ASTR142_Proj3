@@ -2,7 +2,7 @@
 N-body simulation integration module in C++
 Handles the main simulation loop with leapfrog integration
 Calls Python accel module for gravitational acceleration calculations
-Streaming, returns data in chunks to avoid memory overflow
+STREAMING VERSION - returns data in chunks to avoid memory overflow
 */
 
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
@@ -163,6 +163,22 @@ static bool check_virial_equilibrium(const std::deque<double>& virial_ratios,
 }
 
 /*
+Update progress bar by calling Python's tqdm.
+*/
+static void update_progress_bar(PyObject* pbar, int n) {
+    if (!pbar || pbar == Py_None) return;
+    
+    PyObject* update_method = PyObject_GetAttrString(pbar, "update");
+    if (update_method) {
+        PyObject* arg = PyLong_FromLong(n);
+        PyObject* result = PyObject_CallFunctionObjArgs(update_method, arg, nullptr);
+        Py_XDECREF(result);
+        Py_DECREF(arg);
+        Py_DECREF(update_method);
+    }
+}
+
+/*
 Run a single N-body simulation using leapfrog integration.
 Yields results in chunks via Python generator to avoid memory overflow.
 
@@ -289,6 +305,28 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     std::vector<std::vector<double>> chunk_buffer;
     chunk_buffer.reserve(chunk_size * N);
     
+    // Create progress bar using tqdm
+    PyObject* tqdm_module = PyImport_ImportModule("tqdm");
+    PyObject* pbar = nullptr;
+    
+    if (tqdm_module) {
+        PyObject* tqdm_class = PyObject_GetAttrString(tqdm_module, "tqdm");
+        if (tqdm_class) {
+            char desc_buffer[64];
+            snprintf(desc_buffer, sizeof(desc_buffer), "Simulation %d", sim_id);
+            
+            PyObject* kwargs = Py_BuildValue("{s:i,s:s,s:s,s:O}", 
+                                            "total", max_step,
+                                            "desc", desc_buffer,
+                                            "unit", "step",
+                                            "leave", Py_True);
+            pbar = PyObject_Call(tqdm_class, PyTuple_New(0), kwargs);
+            Py_DECREF(kwargs);
+            Py_DECREF(tqdm_class);
+        }
+        Py_DECREF(tqdm_module);
+    }
+    
     // Main leapfrog integration loop
     for (int step = 0; step < max_step; step++) {
         double t = step * dt;
@@ -327,6 +365,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
             Py_DECREF(X_arr);
             Py_DECREF(M_arr_np);
             Py_DECREF(all_chunks);
+            Py_XDECREF(pbar);
             return nullptr;
         }
         A = (double*)PyArray_DATA(A_arr);
@@ -398,6 +437,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
                 Py_DECREF(M_arr_np);
                 Py_DECREF(A_arr);
                 Py_DECREF(all_chunks);
+                Py_XDECREF(pbar);
                 return nullptr;
             }
             
@@ -436,16 +476,38 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
                 
                 if (check_virial_equilibrium(virial_ratios, window_size, tolerance)) {
                     equilibrium_reached = true;
+                    
+                    // Update progress bar to completion
+                    if (pbar) {
+                        update_progress_bar(pbar, max_step - step);
+                    }
+                    
                     printf("Virial equilibrium reached at step %d (%.2f years)\n", 
                            step + 1, (step + 1) * dt / yr);
                     break;
                 }
             }
         }
+        
+        // Update progress bar
+        if (pbar && step % 100 == 0) {
+            update_progress_bar(pbar, 100);
+        }
     }
     
     if (!equilibrium_reached) {
         printf("Maximum steps reached without achieving virial equilibrium\n");
+    }
+    
+    // Close progress bar
+    if (pbar) {
+        PyObject* close_method = PyObject_GetAttrString(pbar, "close");
+        if (close_method) {
+            PyObject* result = PyObject_CallObject(close_method, nullptr);
+            Py_XDECREF(result);
+            Py_DECREF(close_method);
+        }
+        Py_DECREF(pbar);
     }
     
     // Clean up numpy arrays

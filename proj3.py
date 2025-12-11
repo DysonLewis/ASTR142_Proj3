@@ -9,6 +9,14 @@ import os
 import threading
 from astropy.io import fits
 from astropy.table import Table
+from tqdm import tqdm
+import warnings
+
+# Suppress matplotlib tight_layout warning
+warnings.filterwarnings('ignore', message='This figure includes Axes that are not compatible with tight_layout')
+
+# Suppress Qt warnings
+os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false'
 
 # Physical constants in CGS units
 AU = 1.496e13      # astronomical unit in cm
@@ -31,10 +39,10 @@ WINDOW_HEIGHT = 800  # Total window height in pixels
 PLOT_STEPS = 100   # Subsample static plots to every Nth step to reduce data density
 
 # Hardcoded parameters, these seem to give a good chance of virial equilibrium 
-N = int(100)
+N = int(2)
 sphere_radius = float(0.001) * AU
-total_mass = float(1e-16) * Msol
-max_years = float(10000)
+total_mass = float(1e-17) * Msol
+max_years = float(20000)
 n_simulations = int(1)
 collision_radius_factor = 0.01
 chunk_steps = 5000  # Write results to FITS every N steps to avoid memory overflow
@@ -122,7 +130,6 @@ def run_and_save_simulation(sim_id, fits_filename, append=False):
     perturb_vel = np.zeros((0, 3))
     
     # Run simulation - returns list of chunk arrays
-    print(f"Running simulation in chunks of {chunk_steps} steps...")
     result_chunks = run_simulation(
         X0, V0, M,
         perturb_indices,
@@ -135,8 +142,6 @@ def run_and_save_simulation(sim_id, fits_filename, append=False):
         yr,
         collision_radius
     )
-    
-    print(f"Received {len(result_chunks)} chunks, writing to FITS...")
     
     # Create FITS file with header on first chunk
     if not append:
@@ -158,42 +163,43 @@ def run_and_save_simulation(sim_id, fits_filename, append=False):
     first_chunk_df = None
     
     # Process and write chunks one at a time
-    for chunk_idx, chunk_array in enumerate(result_chunks):
-        # Convert chunk to DataFrame
-        df_chunk = pd.DataFrame(chunk_array, columns=[
-            "simulation", "time_yr", "body_idx",
-            "x_cm", "y_cm", "z_cm",
-            "vx_cm_s", "vy_cm_s", "vz_cm_s",
-            "KE", "PE"
-        ])
-        
-        df_chunk["E_tot"] = df_chunk["KE"] + df_chunk["PE"]
-        
-        # Keep first chunk for return value
-        if chunk_idx == 0:
-            first_chunk_df = df_chunk.copy()
-        
-        # Convert to astropy Table and append to FITS
-        table = Table.from_pandas(df_chunk)
-        table_hdu = fits.BinTableHDU(table)
-        table_hdu.header['SIMID'] = (sim_id, 'Simulation ID number')
-        table_hdu.header['CHUNK'] = (chunk_idx, 'Chunk number')
-        table_hdu.header['EXTNAME'] = f'SIM_{sim_id}_CHUNK_{chunk_idx}'
-        
-        with fits.open(fits_filename, mode='append') as hdul:
-            hdul.append(table_hdu)
-            hdul.flush()
-        
-        # Clean up this chunk
-        del df_chunk
-        del table
-        del table_hdu
-        gc.collect()
-        
-        if (chunk_idx + 1) % 10 == 0:
-            print(f"  Written {chunk_idx + 1}/{len(result_chunks)} chunks...")
+    with tqdm(total=len(result_chunks), desc=f"Writing chunks (sim {sim_id})", 
+              unit="chunk", leave=True) as pbar:
+        for chunk_idx, chunk_array in enumerate(result_chunks):
+            # Convert chunk to DataFrame
+            df_chunk = pd.DataFrame(chunk_array, columns=[
+                "simulation", "time_yr", "body_idx",
+                "x_cm", "y_cm", "z_cm",
+                "vx_cm_s", "vy_cm_s", "vz_cm_s",
+                "KE", "PE"
+            ])
+            
+            df_chunk["E_tot"] = df_chunk["KE"] + df_chunk["PE"]
+            
+            # Keep first chunk for return value
+            if chunk_idx == 0:
+                first_chunk_df = df_chunk.copy()
+            
+            # Convert to astropy Table and append to FITS
+            table = Table.from_pandas(df_chunk)
+            table_hdu = fits.BinTableHDU(table)
+            table_hdu.header['SIMID'] = (sim_id, 'Simulation ID number')
+            table_hdu.header['CHUNK'] = (chunk_idx, 'Chunk number')
+            table_hdu.header['EXTNAME'] = f'SIM_{sim_id}_CHUNK_{chunk_idx}'
+            
+            with fits.open(fits_filename, mode='append') as hdul:
+                hdul.append(table_hdu)
+                hdul.flush()
+            
+            # Clean up this chunk
+            del df_chunk
+            del table
+            del table_hdu
+            gc.collect()
+            
+            pbar.update(1)
     
-    print(f"Simulation {sim_id} complete and saved to FITS")
+    print(f"Simulation {sim_id} complete")
     
     # Return first chunk for visualization
     return first_chunk_df
@@ -242,13 +248,14 @@ def create_static_plots(df, fits_filename):
     """
     import gc
     
-    print(f"Creating static plots with subsampling every {PLOT_STEPS} steps...")
+    print(f"\nCreating static plots (subsampling every {PLOT_STEPS} steps)...")
     
     # Read subsampled data directly from FITS file
     all_times = []
     with fits.open(fits_filename) as hdul:
         # First pass: collect all time points from simulation 1
-        for i in range(1, len(hdul)):
+        print("Collecting time points...")
+        for i in tqdm(range(1, len(hdul)), desc="Scanning chunks", unit="chunk"):
             if 'SIMID' in hdul[i].header and hdul[i].header['SIMID'] == 1:
                 chunk_data = Table(hdul[i].data).to_pandas()
                 times = sorted(chunk_data['time_yr'].unique())
@@ -262,7 +269,8 @@ def create_static_plots(df, fits_filename):
     # Second pass: load only subsampled data
     first_sim_chunks = []
     with fits.open(fits_filename) as hdul:
-        for i in range(1, len(hdul)):
+        print("Loading subsampled data...")
+        for i in tqdm(range(1, len(hdul)), desc="Loading chunks", unit="chunk"):
             if 'SIMID' in hdul[i].header and hdul[i].header['SIMID'] == 1:
                 chunk_data = Table(hdul[i].data).to_pandas()
                 # Filter to only plot_times
@@ -284,6 +292,7 @@ def create_static_plots(df, fits_filename):
     plot_limit = plot_radius_factor * sphere_radius / AU
     
     # First figure: particle-level plots (2x2)
+    print("Generating particle trajectory plots...")
     fig1, axes1 = plt.subplots(2, 2, figsize=(14, 10))
     
     for i in range(plot_particles):
@@ -341,7 +350,7 @@ def create_static_plots(df, fits_filename):
     print("Loading data for energy plots...")
     first_sim_chunks = []
     with fits.open(fits_filename) as hdul:
-        for i in range(1, len(hdul)):
+        for i in tqdm(range(1, len(hdul)), desc="Loading chunks", unit="chunk"):
             if 'SIMID' in hdul[i].header and hdul[i].header['SIMID'] == 1:
                 chunk_data = Table(hdul[i].data).to_pandas()
                 # Filter to only plot_times
@@ -356,6 +365,7 @@ def create_static_plots(df, fits_filename):
     gc.collect()
     
     # Second figure: system-level plots (1x2)
+    print("Generating energy and virial plots...")
     fig2, axes2 = plt.subplots(1, 2, figsize=(14, 5))
     
     system_energy = first_sim.groupby('time_yr').agg({
@@ -452,7 +462,7 @@ def main():
     
     # Read all data from FITS file for final plots
     print("\n" + "=" * 60)
-    print("Reading simulation data from FITS file for plotting...")
+    print("Generating static plots...")
     print("=" * 60)
     
     # Pass fits_filename to plotting function - it will handle memory-efficient loading
