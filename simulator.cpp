@@ -283,6 +283,9 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     for (int step = 0; step < max_step; step++) {
         double t = step * dt;
         
+        // Release GIL for computationally intensive section
+        Py_BEGIN_ALLOW_THREADS
+        
         // Leapfrog step 1: V(t+dt/2) = V(t) + A(t)*dt/2
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < N * 3; i++) {
@@ -304,6 +307,9 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
             X_arr_data[i] = X[i];
         }
         
+        // Reacquire GIL before calling Python function
+        Py_END_ALLOW_THREADS
+        
         // Compute A(t+dt) at new positions
         Py_DECREF(A_arr);
         A_arr = call_get_accel(X_arr, M_arr_np);
@@ -314,11 +320,17 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         }
         A = (double*)PyArray_DATA(A_arr);
         
+        // Release GIL again for computation
+        Py_BEGIN_ALLOW_THREADS
+        
         // Leapfrog step 3: V(t+dt) = V(t+dt/2) + A(t+dt)*dt/2
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < N * 3; i++) {
             V[i] += A[i] * dt / 2.0;
         }
+        
+        // Reacquire GIL before modifying Python objects
+        Py_END_ALLOW_THREADS
         
         // Compute kinetic energy for each particle: KE = 0.5*m*v^2
         std::vector<double> KE(N);

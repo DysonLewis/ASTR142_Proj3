@@ -50,6 +50,9 @@ static PyObject* get_accel([[maybe_unused]] PyObject* self, PyObject* args) {
     double* M_in = (double*)PyArray_DATA(M_arr);
     double* A = (double*)PyArray_DATA(A_arr);
     
+    // Release GIL during computation - this allows other Python threads to run
+    Py_BEGIN_ALLOW_THREADS
+    
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < N; i++) {
         // Use long double for all internal calculations
@@ -91,6 +94,9 @@ static PyObject* get_accel([[maybe_unused]] PyObject* self, PyObject* args) {
         A[i*3 + 1] = (double)ay;
         A[i*3 + 2] = (double)az;
     }
+    
+    // Reacquire GIL before returning to Python
+    Py_END_ALLOW_THREADS
     
     return (PyObject*)A_arr;
 }
