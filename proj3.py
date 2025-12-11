@@ -28,13 +28,14 @@ TRAIL_LENGTH = 50  # Number of historical positions to keep per particle
 TARGET_FPS = 30    # Target frames per second for animation
 WINDOW_WIDTH = 1400  # Total window width in pixels
 WINDOW_HEIGHT = 800  # Total window height in pixels
+PLOT_STEPS = 1000   # Subsample static plots to every Nth step to reduce data density
 
 # Hardcoded parameters, these seem to give a good chance of virial equilibrium 
-N = int(10)
+N = int(4)
 sphere_radius = float(0.001) * AU
 total_mass = float(1e-16) * Msol
-max_years = float(10000)
-n_simulations = int(3)
+max_years = float(50000)
+n_simulations = int(1)
 collision_radius_factor = 0.01
 
 # # Get simulation parameters from user
@@ -185,8 +186,25 @@ def background_simulations(fits_filename, start_sim, end_sim):
         start_sim: first simulation ID to run (inclusive)
         end_sim: last simulation ID to run (inclusive)
     """
+    import os
+    
+    # Set lower priority for this thread to not interfere with visualization
+    try:
+        os.nice(10)  # Lower priority (higher niceness value)
+    except:
+        pass  # If it fails (e.g., on Windows), just continue
+    
+    # Limit OpenMP threads for background simulations to leave cores for visualization
+    original_threads = accel.get_num_threads()
+    background_threads = max(1, original_threads // 2)  # Use half the threads
+    os.environ['OMP_NUM_THREADS'] = str(background_threads)
+    print(f"Background simulations using {background_threads}/{original_threads} threads")
+    
     for sim_id in range(start_sim, end_sim + 1):
         run_and_save_simulation(sim_id, fits_filename, append=True)
+    
+    # Restore thread count (though thread is about to end anyway)
+    os.environ['OMP_NUM_THREADS'] = str(original_threads)
     
     print("\nAll background simulations complete")
 
@@ -200,6 +218,12 @@ def create_static_plots(df, fits_filename):
         fits_filename: name of FITS file (for plot filenames)
     """
     first_sim = df[df["simulation"] == 1]
+    
+    # Subsample data to every PLOT_STEPS for plotting efficiency
+    unique_times = sorted(first_sim['time_yr'].unique())
+    plot_times = unique_times[::PLOT_STEPS]
+    first_sim = first_sim[first_sim['time_yr'].isin(plot_times)]
+    
     plot_particles = min(10, N)
     plot_radius_factor = 3.0
     plot_limit = plot_radius_factor * sphere_radius / AU
