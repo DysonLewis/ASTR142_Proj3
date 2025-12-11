@@ -22,6 +22,7 @@ os.makedirs(plot_dir, exist_ok=True)
 num_threads = accel.get_num_threads()
 print(f"OpenMP threads available: {num_threads}")
 
+
 # Visualization parameters
 TRAIL_LENGTH = 50  # Number of historical positions to keep per particle
 TARGET_FPS = 30    # Target frames per second for animation
@@ -30,7 +31,7 @@ WINDOW_HEIGHT = 800  # Total window height in pixels
 PLOT_STEPS = 100   # Subsample static plots to every Nth step to reduce data density
 
 # Hardcoded parameters, these seem to give a good chance of virial equilibrium 
-N = int(10)
+N = int(100)
 sphere_radius = float(0.001) * AU
 total_mass = float(1e-16) * Msol
 max_years = float(10000)
@@ -233,17 +234,50 @@ def background_simulations(fits_filename, start_sim, end_sim):
 def create_static_plots(df, fits_filename):
     """
     Generate static analysis plots from all simulation data.
+    Loads data in subsampled chunks to avoid memory overflow.
     
     Args:
-        df: pandas DataFrame with all simulation data
+        df: UNUSED - kept for compatibility
         fits_filename: name of FITS file (for plot filenames)
     """
-    first_sim = df[df["simulation"] == 1]
+    import gc
     
-    # Subsample data to every PLOT_STEPS for plotting efficiency
-    unique_times = sorted(first_sim['time_yr'].unique())
-    plot_times = unique_times[::PLOT_STEPS]
-    first_sim = first_sim[first_sim['time_yr'].isin(plot_times)]
+    print(f"Creating static plots with subsampling every {PLOT_STEPS} steps...")
+    
+    # Read subsampled data directly from FITS file
+    all_times = []
+    with fits.open(fits_filename) as hdul:
+        # First pass: collect all time points from simulation 1
+        for i in range(1, len(hdul)):
+            if 'SIMID' in hdul[i].header and hdul[i].header['SIMID'] == 1:
+                chunk_data = Table(hdul[i].data).to_pandas()
+                times = sorted(chunk_data['time_yr'].unique())
+                all_times.extend(times)
+    
+    # Subsample time points
+    all_times = sorted(list(set(all_times)))
+    plot_times = set(all_times[::PLOT_STEPS])
+    print(f"Subsampled to {len(plot_times)} time points from {len(all_times)} total")
+    
+    # Second pass: load only subsampled data
+    first_sim_chunks = []
+    with fits.open(fits_filename) as hdul:
+        for i in range(1, len(hdul)):
+            if 'SIMID' in hdul[i].header and hdul[i].header['SIMID'] == 1:
+                chunk_data = Table(hdul[i].data).to_pandas()
+                # Filter to only plot_times
+                chunk_subset = chunk_data[chunk_data['time_yr'].isin(plot_times)]
+                if len(chunk_subset) > 0:
+                    first_sim_chunks.append(chunk_subset)
+                del chunk_data
+                gc.collect()
+    
+    # Concatenate subsampled chunks
+    first_sim = pd.concat(first_sim_chunks, ignore_index=True)
+    del first_sim_chunks
+    gc.collect()
+    
+    print(f"Loaded {len(first_sim)} rows for plotting")
     
     plot_particles = min(10, N)
     plot_radius_factor = 3.0
@@ -299,6 +333,28 @@ def create_static_plots(df, fits_filename):
     # plt.show()
     plt.close()
     
+    # Clear memory before next plot
+    del first_sim
+    gc.collect()
+    
+    # Reload subsampled data for energy plots (we need aggregated data)
+    print("Loading data for energy plots...")
+    first_sim_chunks = []
+    with fits.open(fits_filename) as hdul:
+        for i in range(1, len(hdul)):
+            if 'SIMID' in hdul[i].header and hdul[i].header['SIMID'] == 1:
+                chunk_data = Table(hdul[i].data).to_pandas()
+                # Filter to only plot_times
+                chunk_subset = chunk_data[chunk_data['time_yr'].isin(plot_times)]
+                if len(chunk_subset) > 0:
+                    first_sim_chunks.append(chunk_subset)
+                del chunk_data
+                gc.collect()
+    
+    first_sim = pd.concat(first_sim_chunks, ignore_index=True)
+    del first_sim_chunks
+    gc.collect()
+    
     # Second figure: system-level plots (1x2)
     fig2, axes2 = plt.subplots(1, 2, figsize=(14, 5))
     
@@ -332,6 +388,12 @@ def create_static_plots(df, fits_filename):
     plt.savefig(os.path.join(plot_dir, f"Virial_for_{N}_particles.png"), dpi=300, bbox_inches='tight')
     # plt.show()
     plt.close()
+    
+    # Final cleanup
+    del first_sim
+    gc.collect()
+    
+    print("Static plots complete!")
 
 
 def main():
@@ -393,25 +455,8 @@ def main():
     print("Reading simulation data from FITS file for plotting...")
     print("=" * 60)
     
-    # Read and concatenate all chunks for simulation 1 only
-    all_dfs = []
-    with fits.open(fits_filename) as hdul:
-        for i in range(1, len(hdul)):
-            # Only read simulation 1 chunks for plotting
-            if 'SIMID' in hdul[i].header and hdul[i].header['SIMID'] == 1:
-                table = hdul[i].data
-                df = Table(table).to_pandas()
-                all_dfs.append(df)
-    
-    df_all = pd.concat(all_dfs, ignore_index=True)
-    
-    print(f"\nAll simulations complete. Data saved to {fits_filename}")
-    
-    # Generate static plots
-    print("\n" + "=" * 60)
-    print("Generating static analysis plots...")
-    print("=" * 60)
-    create_static_plots(df_all, fits_filename)
+    # Pass fits_filename to plotting function - it will handle memory-efficient loading
+    create_static_plots(None, fits_filename)
     
     print("\nAll done!")
 
