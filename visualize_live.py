@@ -29,6 +29,7 @@ class SimulationVisualizer:
     a virial ratio indicator bar showing system energy balance.
     
     Reads directly from FITS file in streaming fashion to minimize memory usage.
+    Now assumes one HDU per simulation (not one per chunk).
     """
     
     def __init__(self, fits_filename, sim_id, sphere_radius, visualization_interval=1, 
@@ -46,7 +47,7 @@ class SimulationVisualizer:
             target_fps: target frames per second for animation
             window_width: total window width in pixels
             window_height: total window height in pixels
-            chunk_cache_size: number of chunks to keep in memory at once
+            chunk_cache_size: number of time-based chunks to keep in memory at once
         """
         self.fits_filename = fits_filename
         self.sim_id = sim_id
@@ -59,48 +60,58 @@ class SimulationVisualizer:
         
         # Read FITS file to get metadata
         print("Loading simulation metadata from FITS...")
-        with fits.open(fits_filename) as hdul:
+        with fits.open(fits_filename, memmap=True) as hdul:
             # Get number of bodies from header
             self.N = hdul[0].header['N_BODIES']
             
-            # Find all chunks for this simulation and get time points
-            self.chunk_indices = []
-            self.chunk_time_ranges = []  # Store (start_time, end_time) for each chunk
-            all_times = []
-            
+            # Find HDU for this simulation
+            self.sim_hdu_idx = None
             for i in range(1, len(hdul)):
                 if 'SIMID' in hdul[i].header and hdul[i].header['SIMID'] == sim_id:
-                    chunk_data = Table(hdul[i].data).to_pandas()
-                    times = sorted(chunk_data['time_yr'].unique())
-                    
-                    self.chunk_indices.append(i)
-                    self.chunk_time_ranges.append((times[0], times[-1]))
-                    all_times.extend(times)
+                    self.sim_hdu_idx = i
+                    break
             
-            self.all_time_points = sorted(list(set(all_times)))  # Remove duplicates and sort
+            if self.sim_hdu_idx is None:
+                raise ValueError(f"Could not find simulation {sim_id} in FITS file")
+            
+            # Get all unique time points efficiently by sampling
+            # Read just the time_yr column to build index
+            print(f"Building time index for simulation {sim_id}...")
+            time_col = hdul[self.sim_hdu_idx].data['time_yr']
+            self.all_time_points = sorted(list(set(time_col)))
             self.n_total_frames = len(self.all_time_points)
-        
-        # Build index: time_val -> chunk_hdu_idx for fast lookup
-        self.time_to_chunk = {}
-        for chunk_idx, (start_time, end_time) in zip(self.chunk_indices, self.chunk_time_ranges):
-            for time_val in self.all_time_points:
-                if start_time <= time_val <= end_time:
-                    self.time_to_chunk[time_val] = chunk_idx
             
-        print(f"Found {len(self.chunk_indices)} chunks with {self.n_total_frames} time points")
+            # Build index: time_val -> row range for fast lookup
+            # Group consecutive rows by time to create chunks
+            self.time_to_row_range = {}
+            current_time = None
+            start_row = 0
+            
+            for row_idx, time_val in enumerate(time_col):
+                if time_val != current_time:
+                    if current_time is not None:
+                        self.time_to_row_range[current_time] = (start_row, row_idx)
+                    current_time = time_val
+                    start_row = row_idx
+            
+            # Don't forget the last time point
+            if current_time is not None:
+                self.time_to_row_range[current_time] = (start_row, len(time_col))
+            
+            print(f"Found {self.n_total_frames} time points")
         
         self.current_time_index = 0
         
-        # Chunk cache: {chunk_hdu_index: dataframe}
+        # Chunk cache: {time_val: dataframe}
         self.chunk_cache = {}
         self.chunk_lru = deque(maxlen=chunk_cache_size)
         
-        # Preload first few chunks
-        print("Preloading initial chunks...")
-        chunks_to_preload = min(chunk_cache_size, len(self.chunk_indices))
-        for i in range(chunks_to_preload):
-            self._load_chunk(self.chunk_indices[i])
-        print(f"Preloaded {chunks_to_preload} chunks")
+        # Preload first few time points
+        print("Preloading initial frames...")
+        frames_to_preload = min(chunk_cache_size, len(self.all_time_points))
+        for i in range(frames_to_preload):
+            self._load_frame(self.all_time_points[i])
+        print(f"Preloaded {frames_to_preload} frames")
         
         # Trail data: each particle has deque of (x, y) positions
         self.particle_trails = [deque(maxlen=trail_length) for _ in range(self.N)]
@@ -125,34 +136,42 @@ class SimulationVisualizer:
         
         self._setup_figure()
     
-    def _load_chunk(self, chunk_hdu_idx):
+    def _load_frame(self, time_val):
         """
-        Load a chunk from FITS file into cache.
+        Load data for a specific time value from FITS file into cache.
         
         Args:
-            chunk_hdu_idx: HDU index in FITS file
+            time_val: time in years
         """
         # Check if already cached
-        if chunk_hdu_idx in self.chunk_cache:
+        if time_val in self.chunk_cache:
             return
         
         # If cache is full, remove oldest
         if len(self.chunk_cache) >= self.chunk_cache_size:
             if len(self.chunk_lru) > 0:
-                old_chunk = self.chunk_lru.popleft()
-                if old_chunk in self.chunk_cache:
-                    del self.chunk_cache[old_chunk]
+                old_time = self.chunk_lru.popleft()
+                if old_time in self.chunk_cache:
+                    del self.chunk_cache[old_time]
         
-        # Load chunk from FITS
-        with fits.open(self.fits_filename) as hdul:
-            chunk_data = Table(hdul[chunk_hdu_idx].data).to_pandas()
-            self.chunk_cache[chunk_hdu_idx] = chunk_data
-            self.chunk_lru.append(chunk_hdu_idx)
+        # Get row range for this time point
+        if time_val not in self.time_to_row_range:
+            return
+        
+        start_row, end_row = self.time_to_row_range[time_val]
+        
+        # Load only these rows from FITS
+        with fits.open(self.fits_filename, memmap=True) as hdul:
+            # Use array slicing to read only needed rows
+            subset_data = hdul[self.sim_hdu_idx].data[start_row:end_row]
+            frame_df = Table(subset_data).to_pandas()
+            
+            self.chunk_cache[time_val] = frame_df
+            self.chunk_lru.append(time_val)
     
     def _get_frame_data(self, time_val):
         """
-        Get data for a specific time value, loading chunks as needed.
-        Uses prebuilt index for O(1) lookup.
+        Get data for a specific time value, loading from FITS if needed.
         
         Args:
             time_val: time in years
@@ -160,27 +179,21 @@ class SimulationVisualizer:
         Returns:
             DataFrame for that time point
         """
-        # Fast lookup using index
-        chunk_hdu_idx = self.time_to_chunk.get(time_val)
-        if chunk_hdu_idx is None:
-            return None
-        
-        # Load chunk if not in cache
-        if chunk_hdu_idx not in self.chunk_cache:
-            self._load_chunk(chunk_hdu_idx)
+        # Load frame if not in cache
+        if time_val not in self.chunk_cache:
+            self._load_frame(time_val)
             
-            # Predictive preloading: load next chunk too if not already loaded
+            # Predictive preloading: load next frame too if not already loaded
             try:
-                next_chunk_idx = self.chunk_indices[self.chunk_indices.index(chunk_hdu_idx) + 1]
-                if next_chunk_idx not in self.chunk_cache:
-                    self._load_chunk(next_chunk_idx)
+                current_idx = self.all_time_points.index(time_val)
+                if current_idx + 1 < len(self.all_time_points):
+                    next_time = self.all_time_points[current_idx + 1]
+                    if next_time not in self.chunk_cache:
+                        self._load_frame(next_time)
             except (ValueError, IndexError):
-                pass  # No next chunk or already at end
+                pass  # No next frame or already at end
         
-        chunk_df = self.chunk_cache[chunk_hdu_idx]
-        
-        # Return rows for this time (use numpy for speed)
-        return chunk_df[chunk_df['time_yr'] == time_val]
+        return self.chunk_cache.get(time_val)
         
     def _setup_figure(self):
         """
@@ -412,7 +425,7 @@ class SimulationVisualizer:
         # Clamp to valid range
         self.current_time_index = min(self.current_time_index, self.n_total_frames - 1)
         
-        # Get data for current time point (streaming from FITS)
+        # Get data for current time point
         current_time = self.all_time_points[self.current_time_index]
         frame_data = self._get_frame_data(current_time)
         

@@ -39,7 +39,7 @@ WINDOW_HEIGHT = 800  # Total window height in pixels
 PLOT_STEPS = 100   # Subsample static plots to every Nth step to reduce data density
 
 # Hardcoded parameters, these seem to give a good chance of virial equilibrium 
-N = int(10)
+N = int(5)
 sphere_radius = float(0.001) * AU
 total_mass = float(1e-17) * Msol
 max_years = float(10000)
@@ -107,6 +107,7 @@ def generate_sphere_particles(N, radius):
 def run_and_save_simulation(sim_id, fits_filename, append=False):
     """
     Run a single simulation and save to FITS file incrementally.
+    All chunks from this simulation go into a single HDU.
     
     Args:
         sim_id: simulation identifier (1-indexed)
@@ -143,7 +144,7 @@ def run_and_save_simulation(sim_id, fits_filename, append=False):
         collision_radius
     )
     
-    # Create FITS file with header on first chunk
+    # Create FITS file with header on first simulation
     if not append:
         primary_hdu = fits.PrimaryHDU()
         primary_hdu.header['N_BODIES'] = N
@@ -161,6 +162,10 @@ def run_and_save_simulation(sim_id, fits_filename, append=False):
     
     # Keep first chunk for visualization
     first_chunk_df = None
+    
+    # Create initial empty HDU for this simulation with first chunk
+    # This establishes the table structure
+    first_chunk_created = False
     
     # Process and write chunks one at a time
     with tqdm(total=len(result_chunks), desc=f"Writing chunks (sim {sim_id})", 
@@ -180,21 +185,49 @@ def run_and_save_simulation(sim_id, fits_filename, append=False):
             if chunk_idx == 0:
                 first_chunk_df = df_chunk.copy()
             
-            # Convert to astropy Table and append to FITS
+            # Convert to astropy Table
             table = Table.from_pandas(df_chunk)
-            table_hdu = fits.BinTableHDU(table)
-            table_hdu.header['SIMID'] = (sim_id, 'Simulation ID number')
-            table_hdu.header['CHUNK'] = (chunk_idx, 'Chunk number')
-            table_hdu.header['EXTNAME'] = f'SIM_{sim_id}_CHUNK_{chunk_idx}'
             
-            with fits.open(fits_filename, mode='append') as hdul:
-                hdul.append(table_hdu)
-                hdul.flush()
+            if not first_chunk_created:
+                # Create the HDU with first chunk
+                table_hdu = fits.BinTableHDU(table)
+                table_hdu.header['SIMID'] = (sim_id, 'Simulation ID number')
+                table_hdu.header['EXTNAME'] = f'SIM_{sim_id}'
+                
+                with fits.open(fits_filename, mode='append') as hdul:
+                    hdul.append(table_hdu)
+                    hdul.flush()
+                
+                first_chunk_created = True
+                del table_hdu
+            else:
+                # Append rows to existing HDU
+                # Need to read, append, and write back
+                with fits.open(fits_filename, mode='update') as hdul:
+                    # Find our HDU (it's the last one we just created)
+                    target_hdu_idx = None
+                    for i in range(len(hdul) - 1, 0, -1):  # Search backwards
+                        if 'SIMID' in hdul[i].header and hdul[i].header['SIMID'] == sim_id:
+                            target_hdu_idx = i
+                            break
+                    
+                    if target_hdu_idx is not None:
+                        # Get existing data
+                        existing_data = hdul[target_hdu_idx].data
+                        
+                        # Convert new table to structured array matching existing dtype
+                        new_data = np.array(table.as_array(), dtype=existing_data.dtype)
+                        
+                        # Concatenate using numpy - simpler than stack_arrays
+                        combined_data = np.concatenate([existing_data, new_data])
+                        
+                        # Replace HDU data
+                        hdul[target_hdu_idx].data = combined_data
+                        hdul.flush()
             
             # Clean up this chunk
             del df_chunk
             del table
-            del table_hdu
             gc.collect()
             
             pbar.update(1)
@@ -251,38 +284,32 @@ def create_static_plots(df, fits_filename):
     print(f"\nCreating static plots (subsampling every {PLOT_STEPS} steps)...")
     
     # Read subsampled data directly from FITS file
+    # Now each simulation is in a single HDU
     all_times = []
     with fits.open(fits_filename) as hdul:
-        # First pass: collect all time points from simulation 1
-        print("Collecting time points...")
-        for i in tqdm(range(1, len(hdul)), desc="Scanning chunks", unit="chunk"):
+        # Find HDU for simulation 1
+        sim_hdu_idx = None
+        for i in range(1, len(hdul)):
             if 'SIMID' in hdul[i].header and hdul[i].header['SIMID'] == 1:
-                chunk_data = Table(hdul[i].data).to_pandas()
-                times = sorted(chunk_data['time_yr'].unique())
-                all_times.extend(times)
+                sim_hdu_idx = i
+                break
+        
+        if sim_hdu_idx is None:
+            print("Error: Could not find simulation 1 data")
+            return
+        
+        # Load all data for simulation 1
+        print("Loading simulation 1 data...")
+        sim_data = Table(hdul[sim_hdu_idx].data).to_pandas()
+        all_times = sorted(sim_data['time_yr'].unique())
     
     # Subsample time points
-    all_times = sorted(list(set(all_times)))
     plot_times = set(all_times[::PLOT_STEPS])
     print(f"Subsampled to {len(plot_times)} time points from {len(all_times)} total")
     
-    # Second pass: load only subsampled data
-    first_sim_chunks = []
-    with fits.open(fits_filename) as hdul:
-        print("Loading subsampled data...")
-        for i in tqdm(range(1, len(hdul)), desc="Loading chunks", unit="chunk"):
-            if 'SIMID' in hdul[i].header and hdul[i].header['SIMID'] == 1:
-                chunk_data = Table(hdul[i].data).to_pandas()
-                # Filter to only plot_times
-                chunk_subset = chunk_data[chunk_data['time_yr'].isin(plot_times)]
-                if len(chunk_subset) > 0:
-                    first_sim_chunks.append(chunk_subset)
-                del chunk_data
-                gc.collect()
-    
-    # Concatenate subsampled chunks
-    first_sim = pd.concat(first_sim_chunks, ignore_index=True)
-    del first_sim_chunks
+    # Filter to only subsampled times
+    first_sim = sim_data[sim_data['time_yr'].isin(plot_times)]
+    del sim_data
     gc.collect()
     
     print(f"Loaded {len(first_sim)} rows for plotting")
@@ -341,28 +368,6 @@ def create_static_plots(df, fits_filename):
     plt.savefig(os.path.join(plot_dir, f"system_of_{N}_particles.png"), dpi=300, bbox_inches='tight')
     # plt.show()
     plt.close()
-    
-    # Clear memory before next plot
-    del first_sim
-    gc.collect()
-    
-    # Reload subsampled data for energy plots (we need aggregated data)
-    print("Loading data for energy plots...")
-    first_sim_chunks = []
-    with fits.open(fits_filename) as hdul:
-        for i in tqdm(range(1, len(hdul)), desc="Loading chunks", unit="chunk"):
-            if 'SIMID' in hdul[i].header and hdul[i].header['SIMID'] == 1:
-                chunk_data = Table(hdul[i].data).to_pandas()
-                # Filter to only plot_times
-                chunk_subset = chunk_data[chunk_data['time_yr'].isin(plot_times)]
-                if len(chunk_subset) > 0:
-                    first_sim_chunks.append(chunk_subset)
-                del chunk_data
-                gc.collect()
-    
-    first_sim = pd.concat(first_sim_chunks, ignore_index=True)
-    del first_sim_chunks
-    gc.collect()
     
     # Second figure: system-level plots (1x2)
     print("Generating energy and virial plots...")
