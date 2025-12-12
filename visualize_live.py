@@ -79,8 +79,6 @@ class SimulationVisualizer:
             
             self.all_time_points = sorted(list(set(all_times)))  # Remove duplicates and sort
             self.n_total_frames = len(self.all_time_points)
-            
-        print(f"Found {len(self.chunk_indices)} chunks with {self.n_total_frames} time points")
         
         # Build index: time_val -> chunk_hdu_idx for fast lookup
         self.time_to_chunk = {}
