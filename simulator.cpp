@@ -97,7 +97,7 @@ static double compute_adaptive_timestep(const std::vector<double>& X,
             double r = std::sqrt(dx*dx + dy*dy + dz*dz);
             
             // If particles are close, estimate collision timescale
-            if (r < 5.0 * collision_radius) {
+            if (r < 4.0 * collision_radius) {
                 double vx = V[i*3+0] - V[j*3+0];
                 double vy = V[i*3+1] - V[j*3+1];
                 double vz = V[i*3+2] - V[j*3+2];
@@ -115,7 +115,7 @@ static double compute_adaptive_timestep(const std::vector<double>& X,
     
     // Don't let timestep get too small (would take forever)
     // Also don't let it get too large (instability)
-    min_dt = std::max(min_dt, base_dt * 1e-5);  // Allow down to x of base_dt
+    min_dt = std::max(min_dt, base_dt * 1e-4);  // Allow down to x of base_dt
     min_dt = std::min(min_dt, base_dt);
     
     return min_dt;
@@ -169,14 +169,14 @@ static void handle_collisions(std::vector<double>& X, std::vector<double>& V,
                     // This helps kill tight oscillations without affecting distant encounters
                     long double restitution;
                     if (r < coll_rad) {
-                        // Very close: strong damping to prevent jitter
-                        restitution = 0.95L;
+                        // Very close: damping to prevent jitter
+                        restitution = 0.97L;
                     } else if (r < coll_rad * 1.2L) {
                         // Close: moderate damping
                         restitution = 0.98L;
                     } else {
                         // Approaching but not too close: minimal damping
-                        restitution = 0.9995L;
+                        restitution = 0.999L;
                     }
                     
                     long double impulse = 2.0L * m_i * m_j * v_rel_n / m_total * restitution;
@@ -349,12 +349,18 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     
     // Virial equilibrium tracking
     std::deque<double> virial_ratios;
-    const int check_interval = 100;     // how often it checks for stability, this does not affect the chance just runtime
+    const int check_interval = 200;     // how often it checks for stability, this does not affect the chance just runtime
     const int window_size = 500;        // how many step it averages over for stability to be true
     const double tolerance = 0.02;      // percent deviation
-    const int min_steps = 1000;         // minimum runtime before checking
+    const int min_steps = 1e6;          // minimum runtime before checking
     bool equilibrium_reached = false;
     
+    // Track actual simulation time (for adaptive timestep)
+    double t = 0.0;
+    
+    // Base timestep for adaptive calculation
+    double base_dt = dt;
+
     // Create a Python list to accumulate all chunks
     PyObject* all_chunks = PyList_New(0);
     if (!all_chunks) {
@@ -371,33 +377,28 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     // Create progress bar using tqdm
     PyObject* tqdm_module = PyImport_ImportModule("tqdm");
     PyObject* pbar = nullptr;
-    
+
     if (tqdm_module) {
         PyObject* tqdm_class = PyObject_GetAttrString(tqdm_module, "tqdm");
         if (tqdm_class) {
             char desc_buffer[64];
             snprintf(desc_buffer, sizeof(desc_buffer), "Simulation %d", sim_id);
             
-            PyObject* kwargs = Py_BuildValue("{s:i,s:s,s:s,s:O}", 
-                                            "total", max_step,
+            PyObject* kwargs = Py_BuildValue("{s:s,s:s,s:O,s:s}", 
                                             "desc", desc_buffer,
                                             "unit", "step",
-                                            "leave", Py_True);
+                                            "leave", Py_True,
+                                            "bar_format", "{desc}: {n} steps | {postfix}");
             pbar = PyObject_Call(tqdm_class, PyTuple_New(0), kwargs);
             Py_DECREF(kwargs);
             Py_DECREF(tqdm_class);
         }
         Py_DECREF(tqdm_module);
     }
-    
-    // Track actual simulation time (for adaptive timestep)
-    double t = 0.0;
-    
-    // Base timestep for adaptive calculation
-    double base_dt = dt;
-    
+
     // Main leapfrog integration loop
-    for (int step = 0; step < max_step; step++) {
+    int step = 0;
+    while (t < max_step * base_dt) {
         // Compute adaptive timestep based on current state
         double current_dt = compute_adaptive_timestep(X, V, N, base_dt, collision_radius);
         
@@ -451,6 +452,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         
         // Update time (use adaptive dt)
         t += current_dt;
+        step++;
         
         // Reacquire GIL before modifying Python objects
         Py_END_ALLOW_THREADS
@@ -494,7 +496,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         for (int i = 0; i < N; i++) {
             std::vector<double> row(11);
             row[0] = sim_id;
-            row[1] = t / yr;  // Use actual simulated time
+            row[1] = t / yr;
             row[2] = i;
             row[3] = X[i*3 + 0];
             row[4] = X[i*3 + 1];
@@ -508,7 +510,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         }
         
         // When chunk is full or we're done, yield it
-        if ((int)chunk_buffer.size() >= chunk_size * N || step == max_step - 1) {
+        if ((int)chunk_buffer.size() >= chunk_size * N || t >= max_step * base_dt) {
             // Create numpy array for this chunk
             npy_intp chunk_dims[2] = {(npy_intp)chunk_buffer.size(), 11};
             PyArrayObject* chunk_arr = (PyArrayObject*)PyArray_ZEROS(2, chunk_dims, NPY_DOUBLE, 0);
@@ -537,7 +539,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         }
         
         // Check virial equilibrium every check_interval steps
-        if (step % check_interval == 0 && step >= min_steps) {
+        if (step % check_interval == 0 && step >= min_steps ) {
             double total_KE = 0.0;
             double total_PE = 0.0;
             
@@ -559,11 +561,12 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
                     
                     // Update progress bar to completion
                     if (pbar) {
-                        update_progress_bar(pbar, max_step - step);
+                        int remaining_steps = max_step - (int)(t / base_dt);
+                        update_progress_bar(pbar, remaining_steps);
                     }
                     
                     printf("Virial equilibrium reached at step %d (%.2f years)\n", 
-                           step + 1, t / yr);
+                           step, t / yr);
                     break;
                 }
             }
@@ -572,6 +575,18 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         // Update progress bar
         if (pbar && step % 100 == 0) {
             update_progress_bar(pbar, 100);
+            
+            // Update postfix with current simulation time
+            PyObject* set_postfix = PyObject_GetAttrString(pbar, "set_postfix_str");
+            if (set_postfix) {
+                char time_buffer[64];
+                snprintf(time_buffer, sizeof(time_buffer), "%.1f yr", t / yr);
+                PyObject* time_str = PyUnicode_FromString(time_buffer);
+                PyObject* result = PyObject_CallFunctionObjArgs(set_postfix, time_str, nullptr);
+                Py_XDECREF(result);
+                Py_DECREF(time_str);
+                Py_DECREF(set_postfix);
+            }
         }
     }
     
