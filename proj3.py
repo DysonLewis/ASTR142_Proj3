@@ -39,13 +39,13 @@ WINDOW_HEIGHT = 800  # Total window height in pixels
 PLOT_STEPS = 100   # Subsample static plots to every Nth step to reduce data density
 
 # Hardcoded parameters, these seem to give a good chance of virial equilibrium 
-N = int(2)
+N = int(10)
 sphere_radius = float(0.001) * AU
 total_mass = float(1e-17) * Msol
-max_years = float(20000)
+max_years = float(10000)
 n_simulations = int(1)
-collision_radius_factor = 0.01
-chunk_steps = 5000  # Write results to FITS every N steps to avoid memory overflow
+collision_radius_factor = 0.01 # This also proportionally affects the gravitational smoothing factor
+chunk_steps = 10000  # Write results to FITS every N steps to avoid memory overflow
 
 # # Get simulation parameters from user
 # N = int(input("Enter number of particles: "))
@@ -56,7 +56,7 @@ chunk_steps = 5000  # Write results to FITS every N steps to avoid memory overfl
 
 # Calculate derived parameters
 particle_mass = total_mass / N
-dt = 0.01 * yr
+dt = 0.1 * yr
 max_step = int((max_years * yr) / dt)
 collision_radius = collision_radius_factor * sphere_radius
 
