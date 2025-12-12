@@ -3,6 +3,10 @@ N-body simulation integration module in C++
 Handles the main simulation loop with leapfrog integration
 Calls Python accel module for gravitational acceleration calculations
 Streaming, returns data in chunks to avoid memory overflow
+
+Adaptive timestep when particles get close
+Better collision detection with approach threshold
+Distance-dependent damping for tight oscillations
 */
 
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
@@ -65,8 +69,61 @@ static PyArrayObject* call_get_accel(PyArrayObject* X_arr, PyArrayObject* M_arr,
 }
 
 /*
-Handle elastic collisions between particles.
-Detects when particles are closer than collision_radius and applies elastic collision physics.
+Compute adaptive timestep based on particle proximity and relative velocities.
+Reduces timestep when particles are close to resolve rapid oscillations.
+
+Args:
+    X: positions vector (flattened)
+    V: velocities vector (flattened)
+    N: number of particles
+    base_dt: base timestep in seconds
+    collision_radius: collision detection radius
+    
+Returns:
+    adaptive timestep in seconds
+*/
+static double compute_adaptive_timestep(const std::vector<double>& X, 
+                                       const std::vector<double>& V,
+                                       int N, double base_dt, 
+                                       double collision_radius) {
+    double min_dt = base_dt;
+    double safety_factor = 1e-4;  // Want timestep << collision timescale
+    
+    for (int i = 0; i < N; i++) {
+        for (int j = i+1; j < N; j++) {
+            double dx = X[i*3+0] - X[j*3+0];
+            double dy = X[i*3+1] - X[j*3+1];
+            double dz = X[i*3+2] - X[j*3+2];
+            double r = std::sqrt(dx*dx + dy*dy + dz*dz);
+            
+            // If particles are close, estimate collision timescale
+            if (r < 5.0 * collision_radius) {
+                double vx = V[i*3+0] - V[j*3+0];
+                double vy = V[i*3+1] - V[j*3+1];
+                double vz = V[i*3+2] - V[j*3+2];
+                double v_rel = std::sqrt(vx*vx + vy*vy + vz*vz);
+                
+                if (v_rel > 1e-9) {
+                    // Timescale to cross collision radius
+                    double collision_timescale = collision_radius / v_rel;
+                    double required_dt = safety_factor * collision_timescale;
+                    min_dt = std::min(min_dt, required_dt);
+                }
+            }
+        }
+    }
+    
+    // Don't let timestep get too small (would take forever)
+    // Also don't let it get too large (instability)
+    min_dt = std::max(min_dt, base_dt * 1e-5);  // Allow down to x of base_dt
+    min_dt = std::min(min_dt, base_dt);
+    
+    return min_dt;
+}
+
+/*
+Handle elastic collisions between particles with improved detection.
+Detects approaching particles even before collision and applies distance-dependent damping.
 
 Args:
     X: positions vector (flattened)
@@ -87,28 +144,41 @@ static void handle_collisions(std::vector<double>& X, std::vector<double>& V,
             long double dz = (long double)X[i*3+2] - (long double)X[j*3+2];
             long double r = sqrtl(dx*dx + dy*dy + dz*dz);
             
-            if (r < coll_rad && r > 1e-10L) {  // Added r > 1e-10 check for safety
-                // Collision normal vector
+            // Check for approaching particles even if not yet colliding
+            // This helps catch fast-moving particles before they tunnel through
+            long double approach_threshold = coll_rad * 3.0L;
+            
+            if (r < approach_threshold && r > 1e-10L) {
                 long double nx = dx / r;
                 long double ny = dy / r;
                 long double nz = dz / r;
                 
-                // Relative velocity
                 long double v_rel_x = (long double)V[i*3+0] - (long double)V[j*3+0];
                 long double v_rel_y = (long double)V[i*3+1] - (long double)V[j*3+1];
                 long double v_rel_z = (long double)V[i*3+2] - (long double)V[j*3+2];
                 
-                // Relative velocity along normal
                 long double v_rel_n = v_rel_x*nx + v_rel_y*ny + v_rel_z*nz;
                 
-                // Only apply collision if particles are approaching
+                // Apply collision if approaching
                 if (v_rel_n < 0.0L) {
                     long double m_i = (long double)M[i];
                     long double m_j = (long double)M[j];
                     long double m_total = m_i + m_j;
                     
-                    // Elastic collision impulse with slight damping
-                    long double restitution = 0.98L;  // Nearly elastic, but slightly damped
+                    // Distance-dependent damping: more damping when very close
+                    // This helps kill tight oscillations without affecting distant encounters
+                    long double restitution;
+                    if (r < coll_rad) {
+                        // Very close: strong damping to prevent jitter
+                        restitution = 0.95L;
+                    } else if (r < coll_rad * 1.2L) {
+                        // Close: moderate damping
+                        restitution = 0.98L;
+                    } else {
+                        // Approaching but not too close: minimal damping
+                        restitution = 0.9995L;
+                    }
+                    
                     long double impulse = 2.0L * m_i * m_j * v_rel_n / m_total * restitution;
                     
                     // Apply impulse to velocities
@@ -172,7 +242,7 @@ static void update_progress_bar(PyObject* pbar, int n) {
 }
 
 /*
-Run a single N-body simulation using leapfrog integration.
+Run a single N-body simulation using leapfrog integration with adaptive timestep.
 Yields results in chunks via Python generator to avoid memory overflow.
 
 Args:
@@ -184,13 +254,13 @@ Args:
     perturb_vel_arr: unused (kept for compatibility)
     sim_id: simulation identifier
     max_step: maximum number of timesteps
-    dt: timestep in seconds
+    dt: base timestep in seconds
     yr: conversion factor from seconds to years
     collision_radius: minimum distance for collision detection
     chunk_size: number of timesteps to accumulate before yielding
     
 Returns:
-    Python generator that yields chunks of results
+    Python list of chunk arrays
 */
 static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args) {
     PyArrayObject* X0_arr = nullptr;
@@ -281,7 +351,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     std::deque<double> virial_ratios;
     const int check_interval = 100;     // how often it checks for stability, this does not affect the chance just runtime
     const int window_size = 500;        // how many step it averages over for stability to be true
-    const double tolerance = 0.02;      // precent deviation
+    const double tolerance = 0.02;      // percent deviation
     const int min_steps = 1000;         // minimum runtime before checking
     bool equilibrium_reached = false;
     
@@ -320,9 +390,16 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         Py_DECREF(tqdm_module);
     }
     
+    // Track actual simulation time (for adaptive timestep)
+    double t = 0.0;
+    
+    // Base timestep for adaptive calculation
+    double base_dt = dt;
+    
     // Main leapfrog integration loop
     for (int step = 0; step < max_step; step++) {
-        double t = step * dt;
+        // Compute adaptive timestep based on current state
+        double current_dt = compute_adaptive_timestep(X, V, N, base_dt, collision_radius);
         
         // Release GIL for computationally intensive section
         Py_BEGIN_ALLOW_THREADS
@@ -330,13 +407,13 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         // Leapfrog step 1: V(t+dt/2) = V(t) + A(t)*dt/2
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < N * 3; i++) {
-            V[i] += A[i] * dt / 2.0;
+            V[i] += A[i] * current_dt / 2.0;
         }
         
         // Leapfrog step 2: X(t+dt) = X(t) + V(t+dt/2)*dt
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < N * 3; i++) {
-            X[i] += V[i] * dt;
+            X[i] += V[i] * current_dt;
         }
         
         // Handle particle collisions
@@ -369,8 +446,11 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         // Leapfrog step 3: V(t+dt) = V(t+dt/2) + A(t+dt)*dt/2
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < N * 3; i++) {
-            V[i] += A[i] * dt / 2.0;
+            V[i] += A[i] * current_dt / 2.0;
         }
+        
+        // Update time (use adaptive dt)
+        t += current_dt;
         
         // Reacquire GIL before modifying Python objects
         Py_END_ALLOW_THREADS
@@ -396,7 +476,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
                 long double dz = (long double)X[i*3+2] - (long double)X[j*3+2];
                 long double r = sqrtl(dx*dx + dy*dy + dz*dz);
                 
-                // Apply softening
+                // Apply softening (same as in acceleration calculation)
                 long double r_soft = (r < (long double)collision_radius) ? (long double)collision_radius : r;
                 
                 long double pe_term = -G * (long double)M[i] * (long double)M[j] / r_soft;
@@ -414,7 +494,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         for (int i = 0; i < N; i++) {
             std::vector<double> row(11);
             row[0] = sim_id;
-            row[1] = t / yr;
+            row[1] = t / yr;  // Use actual simulated time
             row[2] = i;
             row[3] = X[i*3 + 0];
             row[4] = X[i*3 + 1];
@@ -483,7 +563,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
                     }
                     
                     printf("Virial equilibrium reached at step %d (%.2f years)\n", 
-                           step + 1, (step + 1) * dt / yr);
+                           step + 1, t / yr);
                     break;
                 }
             }
