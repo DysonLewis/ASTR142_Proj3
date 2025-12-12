@@ -87,7 +87,7 @@ static void handle_collisions(std::vector<double>& X, std::vector<double>& V,
             long double dz = (long double)X[i*3+2] - (long double)X[j*3+2];
             long double r = sqrtl(dx*dx + dy*dy + dz*dz);
             
-            if (r < coll_rad) {
+            if (r < coll_rad && r > 1e-10L) {  // Added r > 1e-10 check for safety
                 // Collision normal vector
                 long double nx = dx / r;
                 long double ny = dy / r;
@@ -107,8 +107,9 @@ static void handle_collisions(std::vector<double>& X, std::vector<double>& V,
                     long double m_j = (long double)M[j];
                     long double m_total = m_i + m_j;
                     
-                    // Elastic collision impulse
-                    long double impulse = 2.0L * m_i * m_j * v_rel_n / m_total;
+                    // Elastic collision impulse with slight damping
+                    long double restitution = 0.98L;  // Nearly elastic, but slightly damped
+                    long double impulse = 2.0L * m_i * m_j * v_rel_n / m_total * restitution;
                     
                     // Apply impulse to velocities
                     V[i*3+0] -= (double)((impulse / m_i) * nx);
@@ -118,24 +119,6 @@ static void handle_collisions(std::vector<double>& X, std::vector<double>& V,
                     V[j*3+0] += (double)((impulse / m_j) * nx);
                     V[j*3+1] += (double)((impulse / m_j) * ny);
                     V[j*3+2] += (double)((impulse / m_j) * nz);
-                    
-                    /* This is not needed anymore with gravitational damping
-                    Actually seemed to be less accurate
-                    Two articles overlapping at rest would generate energy from nothing
-                    This of course is wildly physically inaccurate
-
-                    // Separate overlapping particles
-                    long double overlap = coll_rad - r;
-                    long double separation = overlap / 2.0L + 1e-10L;
-                    
-                    X[i*3+0] += (double)(separation * nx);
-                    X[i*3+1] += (double)(separation * ny);
-                    X[i*3+2] += (double)(separation * nz);
-                    
-                    X[j*3+0] -= (double)(separation * nx);
-                    X[j*3+1] -= (double)(separation * ny);
-                    X[j*3+2] -= (double)(separation * nz);
-                    */
                 }
             }
         }
@@ -408,15 +391,22 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         #pragma omp parallel for schedule(dynamic)
         for (int i = 0; i < N; i++) {
             for (int j = i+1; j < N; j++) {
-                double dx = X[i*3+0] - X[j*3+0];
-                double dy = X[i*3+1] - X[j*3+1];
-                double dz = X[i*3+2] - X[j*3+2];
-                double r = std::sqrt(dx*dx + dy*dy + dz*dz);
-                double pe_term = -G * M[i] * M[j] / r;
+                long double dx = (long double)X[i*3+0] - (long double)X[j*3+0];
+                long double dy = (long double)X[i*3+1] - (long double)X[j*3+1];
+                long double dz = (long double)X[i*3+2] - (long double)X[j*3+2];
+                long double r = sqrtl(dx*dx + dy*dy + dz*dz);
+                
+                // Apply softening
+                long double r_soft = (r < (long double)collision_radius) ? (long double)collision_radius : r;
+                
+                long double pe_term = -G * (long double)M[i] * (long double)M[j] / r_soft;
+                
+                // Convert back to double for atomic operations
+                double pe_contrib = (double)(pe_term * 0.5L);
                 #pragma omp atomic
-                PE[i] += pe_term * 0.5;
+                PE[i] += pe_contrib;
                 #pragma omp atomic
-                PE[j] += pe_term * 0.5;
+                PE[j] += pe_contrib;
             }
         }
         
