@@ -21,6 +21,10 @@ def extract_ensemble_statistics(fits_filename):
         
     Returns:
         DataFrame with one row per simulation containing summary statistics
+        n_bodies: number of particles
+        initial_radius: initial sphere radius in cm
+        total_mass: total system mass in g
+        max_years: target simulation duration in years
     """
     stats_list = []
     
@@ -29,8 +33,14 @@ def extract_ensemble_statistics(fits_filename):
         initial_radius = hdul[0].header['SPHRAD']
         total_mass = hdul[0].header['TOTMASS']
         n_sims = hdul[0].header['NSIMS']
+        dt = hdul[0].header['DT']
+        max_step = hdul[0].header['MAXSTEP']
+        
+        # Calculate target max time from timestep and max steps
+        max_years = (max_step * dt) / yr
         
         print(f"Analyzing {n_sims} simulations with {n_bodies} particles each")
+        print(f"Target simulation duration: {max_years:.1f} years")
         
         for i in range(1, len(hdul)):
             if 'SIMID' not in hdul[i].header:
@@ -83,9 +93,13 @@ def extract_ensemble_statistics(fits_filename):
             max_speed = final_speeds.max()
             mean_speed = final_speeds.mean()
             
+            # Check if simulation stopped early (reached equilibrium)
+            stopped_early = final_time < (max_years * 0.99)  # 1% tolerance
+            
             stats_list.append({
                 'sim_id': sim_id,
                 'final_time_yr': final_time,
+                'stopped_early': stopped_early,
                 'time_to_virial_yr': time_to_virial,
                 'final_virial_ratio': final_virial,
                 'final_KE': final_KE,
@@ -101,10 +115,10 @@ def extract_ensemble_statistics(fits_filename):
             })
     
     stats_df = pd.DataFrame(stats_list)
-    return stats_df, n_bodies, initial_radius, total_mass
+    return stats_df, n_bodies, initial_radius, total_mass, max_years
 
 
-def create_ensemble_plots(stats_df, n_bodies, initial_radius, total_mass):
+def create_ensemble_plots(stats_df, n_bodies, initial_radius, total_mass, max_years):
     """
     Create statistical summary plots from ensemble of simulations.
     
@@ -113,30 +127,33 @@ def create_ensemble_plots(stats_df, n_bodies, initial_radius, total_mass):
         n_bodies: number of particles per simulation
         initial_radius: initial sphere radius in cm
         total_mass: total system mass in g
+        max_years: target simulation duration in years
     """
     n_sims = len(stats_df)
     
+    # Count early stopping behavior
+    n_stopped_early = stats_df['stopped_early'].sum()
+    n_ran_full = n_sims - n_stopped_early
+    reached_equilibrium = ~stats_df['time_to_virial_yr'].isna()
+    n_reached_eq = reached_equilibrium.sum()
+    
     fig = plt.figure(figsize=(16, 10))
-    gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+    gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
     
-    ax1 = fig.add_subplot(gs[0, 0])
-    valid_virial_times = stats_df['time_to_virial_yr'].dropna()
-    if len(valid_virial_times) > 0:
-        ax1.hist(valid_virial_times, bins=20, edgecolor='black', alpha=0.7, color='steelblue')
-        ax1.axvline(valid_virial_times.mean(), color='red', linestyle='--', linewidth=2, 
-                   label=f'Mean: {valid_virial_times.mean():.1f} yr')
-        ax1.axvline(valid_virial_times.median(), color='orange', linestyle='--', linewidth=2,
-                   label=f'Median: {valid_virial_times.median():.1f} yr')
-        ax1.set_xlabel('Time to Virial Equilibrium [yr]')
-        ax1.set_ylabel('Count')
-        ax1.set_title('Distribution of Equilibrium Times')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-    else:
-        ax1.text(0.5, 0.5, 'No simulations reached\nvirial equilibrium', 
-                ha='center', va='center', transform=ax1.transAxes)
-        ax1.set_title('Distribution of Equilibrium Times')
+    # Plot 0: Distribution of final simulation times
+    ax0 = fig.add_subplot(gs[0, 0])
+    ax0.hist(stats_df['final_time_yr'], bins=20, edgecolor='black', alpha=0.7, color='teal')
+    ax0.axvline(stats_df['final_time_yr'].mean(), color='red', linestyle='--', linewidth=2, 
+               label=f'Mean: {stats_df["final_time_yr"].mean():.1f} yr')
+    ax0.axvline(max_years, color='black', linestyle='-', linewidth=2, 
+               label=f'Target: {max_years:.1f} yr')
+    ax0.set_xlabel('Final Simulation Time [yr]')
+    ax0.set_ylabel('Count')
+    ax0.set_title(f'Distribution of Final Times\n({n_stopped_early} stopped early, {n_ran_full} ran full)')
+    ax0.legend()
+    ax0.grid(True, alpha=0.3)
     
+    # Plot 2: Distribution of final virial ratios
     ax2 = fig.add_subplot(gs[0, 1])
     ax2.hist(stats_df['final_virial_ratio'], bins=20, edgecolor='black', alpha=0.7, color='forestgreen')
     ax2.axvline(1.0, color='black', linestyle='-', linewidth=2, label='Ideal (1.0)')
@@ -149,6 +166,7 @@ def create_ensemble_plots(stats_df, n_bodies, initial_radius, total_mass):
     ax2.legend()
     ax2.grid(True, alpha=0.3)
     
+    # Plot 3: Distribution of total energy conservation
     ax3 = fig.add_subplot(gs[0, 2])
     ax3.hist(stats_df['energy_drift_percent'], bins=20, edgecolor='black', alpha=0.7, color='crimson')
     ax3.axvline(stats_df['energy_drift_percent'].mean(), color='darkred', linestyle='--', linewidth=2,
@@ -160,6 +178,7 @@ def create_ensemble_plots(stats_df, n_bodies, initial_radius, total_mass):
     ax3.grid(True, alpha=0.3)
     ax3.set_yscale('log')
     
+    # Plot 4: Final energies across simulations
     ax4 = fig.add_subplot(gs[1, 0])
     ax4.scatter(stats_df['sim_id'], stats_df['final_KE'], s=50, alpha=0.6, color='blue', label='KE')
     ax4.scatter(stats_df['sim_id'], np.abs(stats_df['final_PE']), s=50, alpha=0.6, color='red', label='|PE|')
@@ -171,36 +190,8 @@ def create_ensemble_plots(stats_df, n_bodies, initial_radius, total_mass):
     ax4.grid(True, alpha=0.3)
     ax4.set_yscale('log')
     
-    ax5 = fig.add_subplot(gs[1, 1])
-    ax5.scatter(stats_df['sim_id'], stats_df['peak_KE'], s=50, alpha=0.6, color='orange', label='Peak KE')
-    ax5.scatter(stats_df['sim_id'], stats_df['peak_PE_magnitude'], s=50, alpha=0.6, color='teal', label='Peak |PE|')
-    ax5.set_xlabel('Simulation ID')
-    ax5.set_ylabel('Energy [erg]')
-    ax5.set_title('Peak Energies Across Simulations')
-    ax5.legend()
-    ax5.grid(True, alpha=0.3)
-    ax5.set_yscale('log')
-    
-    ax6 = fig.add_subplot(gs[1, 2])
-    ax6.scatter(stats_df['sim_id'], stats_df['max_radius_cm']/AU, s=50, alpha=0.6, color='navy', label='Max radius')
-    ax6.scatter(stats_df['sim_id'], stats_df['mean_radius_cm']/AU, s=50, alpha=0.6, color='skyblue', label='Mean radius')
-    ax6.axhline(initial_radius/AU, color='gray', linestyle='--', linewidth=2, label='Initial radius')
-    ax6.set_xlabel('Simulation ID')
-    ax6.set_ylabel('Radius [AU]')
-    ax6.set_title('Final Radial Extent')
-    ax6.legend()
-    ax6.grid(True, alpha=0.3)
-    
-    ax7 = fig.add_subplot(gs[2, 0])
-    ax7.scatter(stats_df['sim_id'], stats_df['max_speed_cm_s']/1e5, s=50, alpha=0.6, color='darkgreen', label='Max speed')
-    ax7.scatter(stats_df['sim_id'], stats_df['mean_speed_cm_s']/1e5, s=50, alpha=0.6, color='lightgreen', label='Mean speed')
-    ax7.set_xlabel('Simulation ID')
-    ax7.set_ylabel('Speed [km/s]')
-    ax7.set_title('Final Particle Speeds')
-    ax7.legend()
-    ax7.grid(True, alpha=0.3)
-    
-    ax8 = fig.add_subplot(gs[2, 1])
+    # Plot 8: Energy conservation vs equilibrium
+    ax8 = fig.add_subplot(gs[1, 1])
     ax8.scatter(stats_df['final_virial_ratio'], stats_df['energy_drift_percent'], s=50, alpha=0.6, color='purple')
     ax8.axvline(1.0, color='black', linestyle='--', linewidth=1, alpha=0.5)
     ax8.axvspan(0.95, 1.05, alpha=0.1, color='green')
@@ -209,34 +200,49 @@ def create_ensemble_plots(stats_df, n_bodies, initial_radius, total_mass):
     ax8.set_title('Energy Conservation vs Equilibrium')
     ax8.grid(True, alpha=0.3)
     
-    ax9 = fig.add_subplot(gs[2, 2])
+    # Ensemble summary text
+    ax_summary = fig.add_subplot(gs[1, 2])
     summary_text = f"""
-Ensemble summary
-{'='*30}
+Ensemble Summary
+{'='*35}
 Simulations: {n_sims}
-Particles: {n_bodies}
+Particles per sim: {n_bodies}
 Initial radius: {initial_radius/AU:.2e} AU
 Total mass: {total_mass/1.989e33:.2e} M☉
+Target duration: {max_years:.0f} yr
 
-Equilibrium
-{'='*30}
-Reached equilibrium: {(~stats_df['time_to_virial_yr'].isna()).sum()}/{n_sims}
-Mean time: {stats_df['time_to_virial_yr'].mean():.1f} yr
-Std time: {stats_df['time_to_virial_yr'].std():.1f} yr
+Stopping Behavior
+{'='*35}
+Stopped at equilibrium: {n_stopped_early} ({n_stopped_early/n_sims*100:.1f}%)
+Ran to completion: {n_ran_full} ({n_ran_full/n_sims*100:.1f}%)
+Mean final time: {stats_df['final_time_yr'].mean():.1f} yr
+Std final time: {stats_df['final_time_yr'].std():.1f} yr
+Min final time: {stats_df['final_time_yr'].min():.1f} yr
+Max final time: {stats_df['final_time_yr'].max():.1f} yr
 
-Final state
-{'='*30}
+Equilibrium Achievement
+{'='*35}
+Reached equilibrium: {n_reached_eq}/{n_sims} ({n_reached_eq/n_sims*100:.1f}%)
+Mean time to eq: {stats_df['time_to_virial_yr'].mean():.1f} yr
+Std time to eq: {stats_df['time_to_virial_yr'].std():.1f} yr
+
+Final State Quality
+{'='*35}
 Mean virial ratio: {stats_df['final_virial_ratio'].mean():.3f}
 Std virial ratio: {stats_df['final_virial_ratio'].std():.3f}
+In equilibrium zone: {((stats_df['final_virial_ratio'] >= 0.95) & (stats_df['final_virial_ratio'] <= 1.05)).sum()}/{n_sims}
 
-Mean energy drift: {stats_df['energy_drift_percent'].mean():.4f}%
-Max energy drift: {stats_df['energy_drift_percent'].max():.4f}%
+Energy Conservation
+{'='*35}
+Mean drift: {stats_df['energy_drift_percent'].mean():.4f}%
+Max drift: {stats_df['energy_drift_percent'].max():.4f}%
+Min drift: {stats_df['energy_drift_percent'].min():.4f}%
     """
-    ax9.text(0.05, 0.95, summary_text, transform=ax9.transAxes,
-            verticalalignment='top', horizontalalignment='left',
-            fontfamily='monospace', fontsize=9,
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    ax9.axis('off')
+    ax_summary.text(0.05, 0.95, summary_text, transform=ax_summary.transAxes,
+                   verticalalignment='top', horizontalalignment='left',
+                   fontfamily='monospace', fontsize=9,
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    ax_summary.axis('off')
     
     plt.suptitle(f'Ensemble Analysis: {n_sims} Simulations with {n_bodies} Particles', 
                 fontsize=16, fontweight='bold')
@@ -256,19 +262,24 @@ def analyze_ensemble(fits_filename='nbody_simulations.fits'):
         fits_filename: path to FITS file with simulation results
     """
     print("Extracting ensemble statistics...")
-    stats_df, n_bodies, initial_radius, total_mass = extract_ensemble_statistics(fits_filename)
+    stats_df, n_bodies, initial_radius, total_mass, max_years = extract_ensemble_statistics(fits_filename)
     
     csv_filename = os.path.join(plot_dir, 'ensemble_statistics.csv')
     stats_df.to_csv(csv_filename, index=False)
     print(f"Statistics saved to {csv_filename}")
     
     print("\nCreating ensemble plots...")
-    create_ensemble_plots(stats_df, n_bodies, initial_radius, total_mass)
+    create_ensemble_plots(stats_df, n_bodies, initial_radius, total_mass, max_years)
     
     print("\nEnsemble analysis complete!")
+    print(f"\nSummary:")
+    print(f"  Simulations analyzed: {len(stats_df)}")
+    print(f"  Target duration: {max_years:.1f} years")
+    print(f"  Mean actual duration: {stats_df['final_time_yr'].mean():.1f} years")
+    print(f"  Stopped early: {stats_df['stopped_early'].sum()}/{len(stats_df)}")
+    print(f"  Reached equilibrium: {(~stats_df['time_to_virial_yr'].isna()).sum()}/{len(stats_df)}")
     
     return stats_df
-
 
 
 if __name__ == "__main__":
