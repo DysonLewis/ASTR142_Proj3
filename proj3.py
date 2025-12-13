@@ -39,10 +39,10 @@ WINDOW_HEIGHT = 800  # Total window height in pixels
 PLOT_STEPS = 100   # Subsample static plots to every Nth step to reduce data density
 
 # Hardcoded parameters, these seem to give a good chance of virial equilibrium 
-N = int(5)
+N = int(10)
 sphere_radius = float(0.001) * AU
 total_mass = float(1e-17) * Msol
-max_years = float(10000)
+max_years = float(20000)
 n_simulations = int(1)
 collision_radius_factor = 0.01 # This also proportionally affects the gravitational smoothing factor
 chunk_steps = 10000  # Write results to FITS every N steps to avoid memory overflow
@@ -163,9 +163,9 @@ def run_and_save_simulation(sim_id, fits_filename, append=False):
     # Keep first chunk for visualization
     first_chunk_df = None
     
-    # Create initial empty HDU for this simulation with first chunk
-    # This establishes the table structure
-    first_chunk_created = False
+    # Write each chunk as a temporary separate HDU
+    # We'll combine them at the end
+    temp_hdu_indices = []
     
     # Process and write chunks one at a time
     with tqdm(total=len(result_chunks), desc=f"Writing chunks (sim {sim_id})", 
@@ -188,49 +188,78 @@ def run_and_save_simulation(sim_id, fits_filename, append=False):
             # Convert to astropy Table
             table = Table.from_pandas(df_chunk)
             
-            if not first_chunk_created:
-                # Create the HDU with first chunk
-                table_hdu = fits.BinTableHDU(table)
-                table_hdu.header['SIMID'] = (sim_id, 'Simulation ID number')
-                table_hdu.header['EXTNAME'] = f'SIM_{sim_id}'
-                
-                with fits.open(fits_filename, mode='append') as hdul:
-                    hdul.append(table_hdu)
-                    hdul.flush()
-                
-                first_chunk_created = True
-                del table_hdu
-            else:
-                # Append rows to existing HDU
-                # Need to read, append, and write back
-                with fits.open(fits_filename, mode='update') as hdul:
-                    # Find our HDU (it's the last one we just created)
-                    target_hdu_idx = None
-                    for i in range(len(hdul) - 1, 0, -1):  # Search backwards
-                        if 'SIMID' in hdul[i].header and hdul[i].header['SIMID'] == sim_id:
-                            target_hdu_idx = i
-                            break
-                    
-                    if target_hdu_idx is not None:
-                        # Get existing data
-                        existing_data = hdul[target_hdu_idx].data
-                        
-                        # Convert new table to structured array matching existing dtype
-                        new_data = np.array(table.as_array(), dtype=existing_data.dtype)
-                        
-                        # Concatenate using numpy - simpler than stack_arrays
-                        combined_data = np.concatenate([existing_data, new_data])
-                        
-                        # Replace HDU data
-                        hdul[target_hdu_idx].data = combined_data
-                        hdul.flush()
+            # Write as temporary HDU
+            table_hdu = fits.BinTableHDU(table)
+            table_hdu.header['SIMID'] = (sim_id, 'Simulation ID number')
+            table_hdu.header['CHUNKIDX'] = (chunk_idx, 'Temporary chunk index')
+            table_hdu.header['EXTNAME'] = f'SIM_{sim_id}_TEMP_{chunk_idx}'
+            
+            with fits.open(fits_filename, mode='append') as hdul:
+                hdul.append(table_hdu)
+                hdul.flush()
             
             # Clean up this chunk
             del df_chunk
             del table
+            del table_hdu
             gc.collect()
             
             pbar.update(1)
+    
+    # Now combine all temporary chunk HDUs into one final HDU
+    print(f"Combining {len(result_chunks)} chunks into single HDU for simulation {sim_id}...")
+    
+    # Read and concatenate all chunks efficiently
+    with fits.open(fits_filename, mode='update', memmap=True) as hdul:
+        # Find all temporary chunk HDUs for this simulation
+        chunk_hdus = []
+        for i in range(1, len(hdul)):
+            if ('SIMID' in hdul[i].header and 
+                hdul[i].header['SIMID'] == sim_id and
+                'CHUNKIDX' in hdul[i].header):
+                chunk_hdus.append((hdul[i].header['CHUNKIDX'], i))
+        
+        # Sort by chunk index
+        chunk_hdus.sort(key=lambda x: x[0])
+        
+        # Concatenate all chunk data
+        all_data = []
+        for chunk_idx, hdu_idx in chunk_hdus:
+            all_data.append(hdul[hdu_idx].data)
+        
+        combined_data = np.concatenate(all_data)
+        del all_data
+        gc.collect()
+        
+        # Create final HDU with combined data
+        final_hdu = fits.BinTableHDU(combined_data)
+        final_hdu.header['SIMID'] = (sim_id, 'Simulation ID number')
+        final_hdu.header['EXTNAME'] = f'SIM_{sim_id}'
+        
+        # Append final HDU
+        hdul.append(final_hdu)
+        hdul.flush()
+        
+        del combined_data
+        del final_hdu
+        gc.collect()
+    
+    # Remove temporary chunk HDUs
+    print(f"Cleaning up temporary chunks for simulation {sim_id}...")
+    with fits.open(fits_filename, mode='update') as hdul:
+        # Collect indices of temp HDUs to remove (backwards so indices don't shift)
+        indices_to_remove = []
+        for i in range(len(hdul) - 1, 0, -1):
+            if ('SIMID' in hdul[i].header and 
+                hdul[i].header['SIMID'] == sim_id and
+                'CHUNKIDX' in hdul[i].header):
+                indices_to_remove.append(i)
+        
+        # Remove temp HDUs
+        for idx in indices_to_remove:
+            del hdul[idx]
+        
+        hdul.flush()
     
     print(f"Simulation {sim_id} complete")
     
