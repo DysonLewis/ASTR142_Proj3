@@ -268,3 +268,8 @@ def analyze_ensemble(fits_filename='nbody_simulations.fits'):
     print("\nEnsemble analysis complete!")
     
     return stats_df
+
+
+
+if __name__ == "__main__":
+    analyze_ensemble()

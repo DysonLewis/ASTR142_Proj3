@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from simulator import run_simulation
 from visualize_live import SimulationVisualizer
+from ensemble_analysis import analyze_ensemble
 import accel
 import os
 import threading
@@ -39,10 +40,10 @@ WINDOW_HEIGHT = 800  # Total window height in pixels
 PLOT_STEPS = 100   # Subsample static plots to every Nth step to reduce data density
 
 # Hardcoded parameters, these seem to give a good chance of virial equilibrium 
-N = int(10)
+N = int(20)
 sphere_radius = float(0.001) * AU
-total_mass = float(1e-17) * Msol
-max_years = float(20000)
+total_mass = float(1e-18) * Msol
+max_years = float(25000)
 n_simulations = int(1)
 collision_radius_factor = 0.01 # This also proportionally affects the gravitational smoothing factor
 chunk_steps = 10000  # Write results to FITS every N steps to avoid memory overflow
@@ -501,6 +502,9 @@ def main():
     
     # Pass fits_filename to plotting function - it will handle memory-efficient loading
     create_static_plots(None, fits_filename)
+    
+    if n_simulations > 1:
+        analyze_ensemble(fits_filename)
     
     print("\nAll done!")
 

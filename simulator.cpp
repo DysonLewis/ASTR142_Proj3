@@ -87,7 +87,7 @@ static double compute_adaptive_timestep(const std::vector<double>& X,
                                        int N, double base_dt, 
                                        double collision_radius) {
     double min_dt = base_dt;
-    double safety_factor = 1e-4;  // Want timestep << collision timescale
+    double safety_factor = 5e-4;  // Want timestep << collision timescale
     
     for (int i = 0; i < N; i++) {
         for (int j = i+1; j < N; j++) {
@@ -349,10 +349,11 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
     
     // Virial equilibrium tracking
     std::deque<double> virial_ratios;
-    const int check_interval = 200;     // how often it checks for stability, this does not affect the chance just runtime
-    const int window_size = 500;        // how many step it averages over for stability to be true
-    const double tolerance = 0.02;      // percent deviation
-    const int min_steps = 1e6;          // minimum runtime before checking
+    const int check_interval = 100;     // how often it checks for stability, this does not affect the chance just runtime
+    const int window_size = 400;        // how many step it averages over for stability to be true
+    const double tolerance = 0.03;      // percent deviation
+    const int min_steps = 1e5;          // minimum runtime before checking
+    const int min_time = 2000 * yr;     // or this
     bool equilibrium_reached = false;
     
     // Track actual simulation time (for adaptive timestep)
@@ -539,7 +540,7 @@ static PyObject* run_simulation([[maybe_unused]] PyObject* self, PyObject* args)
         }
         
         // Check virial equilibrium every check_interval steps
-        if (step % check_interval == 0 && step >= min_steps ) {
+        if (step % check_interval == 0 && (step >= min_steps || t >= min_time)) {
             double total_KE = 0.0;
             double total_PE = 0.0;
             
